@@ -57,7 +57,8 @@ Mais uma estrofe
 ```
 
 - Separe estrofes por **linha em branco**
-- Formatos de tempo aceitos: `00:05`, `01:30`, `00:05.50`, `1:30.00`
+- Formatos de tempo aceitos: `00:05`, `01:30`, `00:05.50`, `00:05,50`, `1:30.00`, `1:02:03`
+- Estrofes com erro (sem tempo, sem letra, fim antes do início) são listadas e puladas
 
 ### Renderizar
 
@@ -81,8 +82,14 @@ Mais uma estrofe
 
 ## Formato de saída
 
-- **MP4**: Fundo sólido, pronto para usar
-- **WebM**: Transparência total, ideal para sobrepor no Kdenlive como overlay
+- **MP4** (H.264 + AAC): Fundo sólido ou imagem, pronto para usar
+- **WebM** (VP9 + Opus): Transparência total, ideal para sobrepor no Kdenlive como overlay
+- Com áudio, o vídeo dura a música inteira (ou até a última estrofe + 1,5s, o que for maior)
+
+## Desenvolvimento
+
+- Arquitetura: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- Testes (sem dependências extras): `python -m unittest discover -s tests -t .`
 
 ## Dicas
 

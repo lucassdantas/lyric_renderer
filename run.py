@@ -7,19 +7,25 @@ import subprocess
 import sys
 import os
 
-REQUIRED = ["Pillow"]
+# pip package name -> import name
+REQUIRED = {"Pillow": "PIL"}
 
 def check_deps():
     missing = []
-    for pkg in REQUIRED:
+    for pkg, module in REQUIRED.items():
         try:
-            __import__(pkg.lower().replace("-", "_"))
+            __import__(module)
         except ImportError:
             missing.append(pkg)
     return missing
 
 def install(pkgs):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "--break-system-packages", *pkgs])
+    base = [sys.executable, "-m", "pip", "install", *pkgs]
+    try:
+        subprocess.check_call(base)
+    except subprocess.CalledProcessError:
+        # Linux distros with an "externally managed" Python refuse plain installs
+        subprocess.check_call(base + ["--break-system-packages"])
 
 def check_ffmpeg():
     try:
@@ -47,6 +53,7 @@ if __name__ == "__main__":
         print("  Windows: https://ffmpeg.org/download.html")
         input("Pressione Enter para continuar mesmo assim...")
 
-    # Launch app
-    script = os.path.join(os.path.dirname(__file__), "lyric_renderer.py")
-    os.execv(sys.executable, [sys.executable, script])
+    # Launch app. subprocess instead of os.execv: on Windows execv breaks
+    # when the Python path has spaces (e.g. "C:\Program Files\...").
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lyric_renderer.py")
+    sys.exit(subprocess.call([sys.executable, script]))

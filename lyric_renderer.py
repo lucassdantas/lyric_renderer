@@ -41,10 +41,7 @@ class Strophe:
         return self.end_time - self.start_time
 
     def to_mm_ss(self, seconds):
-        m = int(seconds) // 60
-        s = int(seconds) % 60
-        cs = int((seconds % 1) * 100)
-        return f"{m:02d}:{s:02d}.{cs:02d}"
+        return format_time(seconds)
 
     def start_str(self):
         return self.to_mm_ss(self.start_time)
@@ -98,13 +95,82 @@ class Project:
 
     @classmethod
     def from_dict(cls, d):
-        strophes_data = d.pop("strophes", [])
+        strophes_data = d.get("strophes", [])
         # Remove keys not in dataclass (forward compat)
-        valid = {f.name for f in Project.__dataclass_fields__.values()}
-        d = {k: v for k, v in d.items() if k in valid}
-        proj = cls(**d)
-        proj.strophes = [Strophe(**s) for s in strophes_data]
+        valid = {f.name for f in Project.__dataclass_fields__.values()} - {"strophes"}
+        proj = cls(**{k: v for k, v in d.items() if k in valid})
+        s_valid = {f.name for f in Strophe.__dataclass_fields__.values()}
+        proj.strophes = [Strophe(**{k: v for k, v in s.items() if k in s_valid})
+                         for s in strophes_data]
         return proj
+
+
+def format_time(seconds: float) -> str:
+    """Format seconds as MM:SS.cc (rounded to centiseconds)."""
+    total_cs = int(round(seconds * 100))
+    m, rest = divmod(total_cs, 6000)
+    s, cs = divmod(rest, 100)
+    return f"{m:02d}:{s:02d}.{cs:02d}"
+
+
+def safe_filename(name: str) -> str:
+    """Strip characters that are invalid in Windows/Unix file names."""
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name).strip().rstrip(".")
+    return cleaned or "video"
+
+
+_TIME_RE = r"\d{1,2}(?::\d{2}){1,2}(?:[.,]\d+)?"
+_BLOCK_HEADER = re.compile(rf"^({_TIME_RE})\s*[-–—]\s*({_TIME_RE})\s*(.*)$")
+
+
+def parse_lyrics_block(raw: str, next_id: int = 1):
+    """
+    Parse pasted lyrics in the "Colar Bloco" format into strophes.
+    Returns (strophes, errors). Blocks are separated by blank lines and each
+    one starts with "MM:SS - MM:SS" (text on the same line is kept).
+    """
+    strophes, errors = [], []
+    for block in re.split(r"\n\s*\n", raw.strip()):
+        block = block.strip()
+        if not block:
+            continue
+        lines = block.split("\n")
+        first = lines[0].strip()
+        m = _BLOCK_HEADER.match(first)
+        if not m:
+            errors.append(f"Linha sem tempo reconhecido: '{first[:40]}'")
+            continue
+        try:
+            start = parse_time(m.group(1))
+            end = parse_time(m.group(2))
+        except ValueError as e:
+            errors.append(str(e))
+            continue
+        header = f"{m.group(1)} - {m.group(2)}"
+        if end <= start:
+            errors.append(f"Estrofe em {header}: o fim deve ser após o início.")
+            continue
+
+        text_lines = [l.strip() for l in [m.group(3)] + lines[1:] if l.strip()]
+        if not text_lines:
+            errors.append(f"Estrofe em {header}: sem letra.")
+            continue
+
+        strophes.append(Strophe(id=next_id, start_time=start, end_time=end,
+                                text="\n".join(text_lines)))
+        next_id += 1
+    return strophes, errors
+
+
+def next_strophe_times(strophes):
+    """
+    Default (start, end) for a new strophe: 1s after the latest-ending
+    existing strophe, lasting 9s (0–10 → 11–20 → 21–30). First one is 0–10.
+    """
+    if not strophes:
+        return 0.0, 10.0
+    last_end = max(s.end_time for s in strophes)
+    return last_end + 1, last_end + 10
 
 
 def parse_time(s: str) -> float:
@@ -128,6 +194,8 @@ def parse_time(s: str) -> float:
 
 def hex_to_rgb(hex_color: str):
     hex_color = hex_color.lstrip("#")
+    if len(hex_color) == 3:  # short form, e.g. "#fff"
+        hex_color = "".join(c * 2 for c in hex_color)
     return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
 
@@ -135,6 +203,13 @@ def find_font(font_name: str, size: int):
     """Try to find a system font by name, fallback to default."""
     if not HAS_PIL:
         return None
+
+    # A full path to a font file wins over the fuzzy name search below
+    if os.path.isfile(font_name):
+        try:
+            return ImageFont.truetype(font_name, size)
+        except Exception:
+            pass
 
     search_dirs = [
         "C:/Windows/Fonts",
@@ -186,6 +261,79 @@ def _draw_text_centered(draw, text: str, font, color, canvas_w: int, y: int):
     draw.text((tx, y), text, font=font, fill=color)
 
 
+def _subprocess_flags():
+    return subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
+def probe_duration(path: str) -> float:
+    """Media duration in seconds via ffprobe, or 0.0 if unknown."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=30,
+            creationflags=_subprocess_flags(),
+        ).stdout.strip()
+        return float(out)
+    except Exception:
+        return 0.0
+
+
+def build_ffmpeg_cmd(output_path: str, width: int, height: int, fps: int,
+                     transparent: bool, audio_path: str = ""):
+    """
+    Build the ffmpeg command for a raw-frame pipe on stdin.
+    Returns (cmd, final_output_path).
+    - Transparent → always WebM (VP9 + alpha)
+    - .webm       → VP9 + Opus (WebM does not accept H.264/AAC)
+    - otherwise   → H.264 + AAC
+    """
+    ext = Path(output_path).suffix.lower()
+    if transparent and ext != ".webm":
+        output_path = Path(output_path).with_suffix(".webm").as_posix()
+        ext = ".webm"
+    webm = ext == ".webm"
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-pix_fmt", "rgba" if transparent else "rgb24",
+        "-s", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", "pipe:0",
+    ]
+
+    has_audio = bool(audio_path and os.path.isfile(audio_path))
+    if has_audio:
+        cmd += ["-i", audio_path]
+
+    if webm:
+        cmd += [
+            "-c:v", "libvpx-vp9",
+            "-pix_fmt", "yuva420p" if transparent else "yuv420p",
+            "-auto-alt-ref", "0",
+            "-crf", "18",
+            "-b:v", "0",
+        ]
+    else:
+        cmd += [
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-crf", "18",
+            "-preset", "fast",
+        ]
+
+    if has_audio:
+        if webm:
+            cmd += ["-c:a", "libopus", "-b:a", "192k"]
+        else:
+            cmd += ["-c:a", "aac", "-b:a", "192k"]
+        cmd += ["-shortest"]
+
+    cmd.append(output_path)
+    return cmd, output_path
+
+
 class FrameRenderer:
     def __init__(self, project: Project):
         self.proj = project
@@ -199,6 +347,7 @@ class FrameRenderer:
         self.line_height = project.lyric_size + project.line_spacing + 6
         # Sort strophes by start time once
         self.strophes = sorted(project.strophes, key=lambda s: s.start_time)
+        self.lyrics_end = max((s.end_time for s in self.strophes), default=0.0)
 
         # Font — try asset path first, then system search
         font_path = os.path.join(_default_assets_dir(), "fonts", "mvboli.ttf")
@@ -286,20 +435,23 @@ class FrameRenderer:
         if not self.strophes:
             return
         t0 = self.strophes[0].start_time
-        tN = self.strophes[-1].end_time
-        a = self._alpha(t, t0, tN)
+        a = self._alpha(t, t0, self.lyrics_end)
         if a <= 0:
             return
         color = (*self.title_rgb, int(a * 255))
         title_y = int(self.h * 0.08)
         _draw_text_centered(draw, self.proj.title, self.title_font, color, self.w, title_y)
 
-    def _draw_lyric(self, draw, t: float):
-        active = None
+    def active_strophe(self, t: float) -> Optional[Strophe]:
+        """Strophe visible at time t (strictly inside, so back-to-back
+        strophes don't hide each other on the boundary frame)."""
         for s in self.strophes:
-            if s.start_time <= t <= s.end_time:
-                active = s
-                break
+            if s.start_time < t < s.end_time:
+                return s
+        return None
+
+    def _draw_lyric(self, draw, t: float):
+        active = self.active_strophe(t)
         if active is None:
             return
 
@@ -323,70 +475,35 @@ class FrameRenderer:
     def render_video(self, output_path: str, audio_path: str = "",
                      progress_callback=None, cancel_flag=None):
         """
-        Render all frames to video via ffmpeg pipe.
-        - Transparent bg  → WebM (VP9 + alpha)
-        - Background img or solid color → MP4 (H.264)
+        Render all frames to video via ffmpeg pipe (see build_ffmpeg_cmd for
+        the codec choice). The video lasts until the last strophe ends + 1.5s,
+        or until the audio ends, whichever is longer.
         stderr drained in background thread to avoid Windows pipe deadlock.
         """
         if not self.strophes:
             return False, "Nenhuma estrofe adicionada."
 
-        duration = self.strophes[-1].end_time + 1.5
+        has_audio = bool(audio_path and os.path.isfile(audio_path))
+        duration = self.lyrics_end + 1.5
+        if has_audio:
+            duration = max(duration, probe_duration(audio_path))
         total_frames = int(duration * self.fps)
 
-        use_transparent = self._transparent
-        pix_fmt_in  = "rgba"   if use_transparent else "rgb24"
-        ext = Path(output_path).suffix.lower()
+        cmd, output_path = build_ffmpeg_cmd(
+            output_path, self.w, self.h, self.fps, self._transparent,
+            audio_path if has_audio else "")
 
-        # Force .webm for transparent output
-        if use_transparent and ext != ".webm":
-            output_path = Path(output_path).with_suffix(".webm").as_posix()
-
-        cmd = [
-            "ffmpeg", "-y",
-            "-f", "rawvideo",
-            "-pix_fmt", pix_fmt_in,
-            "-s", f"{self.w}x{self.h}",
-            "-r", str(self.fps),
-            "-i", "pipe:0",
-        ]
-
-        has_audio = bool(audio_path and os.path.isfile(audio_path))
-        if has_audio:
-            cmd += ["-i", audio_path]
-
-        if use_transparent:
-            cmd += [
-                "-c:v", "libvpx-vp9",
-                "-pix_fmt", "yuva420p",
-                "-auto-alt-ref", "0",
-                "-crf", "18",
-                "-b:v", "0",
-            ]
-        else:
-            cmd += [
-                "-c:v", "libx264",
-                "-pix_fmt", "yuv420p",
-                "-crf", "18",
-                "-preset", "fast",
-            ]
-
-        if has_audio:
-            cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
-
-        cmd.append(output_path)
-
-        creationflags = 0
-        if sys.platform == "win32":
-            creationflags = subprocess.CREATE_NO_WINDOW
-
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            creationflags=creationflags,
-        )
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                creationflags=_subprocess_flags(),
+            )
+        except FileNotFoundError:
+            return False, ("FFmpeg não encontrado. Instale o FFmpeg e "
+                           "garanta que ele está no PATH.")
 
         # Drain stderr in background to prevent Windows pipe deadlock
         stderr_lines = []
@@ -399,11 +516,18 @@ class FrameRenderer:
         drain_thread = threading.Thread(target=_drain_stderr, daemon=True)
         drain_thread.start()
 
+        def _close_stdin():
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
         try:
             for i in range(total_frames):
                 if cancel_flag and cancel_flag():
-                    proc.stdin.close()
+                    _close_stdin()
                     proc.kill()
+                    proc.wait()
                     return False, "Renderização cancelada."
 
                 frame = self.render_frame_bytes(i / self.fps)
@@ -412,18 +536,18 @@ class FrameRenderer:
                 if progress_callback and i % 15 == 0:
                     progress_callback(i / total_frames)
 
-            proc.stdin.close()
+            _close_stdin()
 
-        except BrokenPipeError:
-            pass
+        except OSError:
+            # ffmpeg exited early (BrokenPipeError, or EINVAL on Windows).
+            # Its stderr, reported below, says why.
+            _close_stdin()
         except Exception as e:
-            try:
-                proc.stdin.close()
-            except Exception:
-                pass
+            _close_stdin()
             proc.kill()
+            proc.wait()
             drain_thread.join(timeout=3)
-            return False, f"Erro ao escrever frames: {e}"
+            return False, f"Erro ao renderizar frames: {e}"
 
         proc.wait()
         drain_thread.join(timeout=10)
@@ -493,7 +617,8 @@ class StyledButton(tk.Button):
 
 class StropheEditor(tk.Toplevel):
     """Dialog to add/edit a strophe."""
-    def __init__(self, parent, strophe: Optional[Strophe] = None, on_save=None):
+    def __init__(self, parent, strophe: Optional[Strophe] = None, on_save=None,
+                 default_start: float = 0.0, default_end: float = 10.0):
         super().__init__(parent)
         self.on_save = on_save
         self.strophe = strophe
@@ -507,6 +632,9 @@ class StropheEditor(tk.Toplevel):
         self._build()
         if strophe:
             self._fill(strophe)
+        else:
+            self.start_var.set(format_time(default_start))
+            self.end_var.set(format_time(default_end))
 
         self.transient(parent)
         self.update_idletasks()
@@ -573,12 +701,8 @@ class StropheEditor(tk.Toplevel):
         StyledButton(btn_frame, "✓  Salvar Estrofe", command=self._save).pack(side="right")
 
     def _fill(self, s: Strophe):
-        def fmt(sec):
-            m = int(sec) // 60
-            sc = sec % 60
-            return f"{m:02d}:{sc:05.2f}"
-        self.start_var.set(fmt(s.start_time))
-        self.end_var.set(fmt(s.end_time))
+        self.start_var.set(format_time(s.start_time))
+        self.end_var.set(format_time(s.end_time))
         self.text_widget.delete("1.0", "end")
         self.text_widget.insert("1.0", s.text)
 
@@ -642,8 +766,9 @@ class SettingsPanel(tk.Frame):
         e.bind("<FocusOut>", lambda _: self._notify())
         return e
 
-    def _spin(self, parent, var, from_, to, width=7):
+    def _spin(self, parent, var, from_, to, width=7, increment=1):
         s = tk.Spinbox(parent, textvariable=var, from_=from_, to=to, width=width,
+                       increment=increment,
                        bg=DARK["entry_bg"], fg=DARK["text"], buttonbackground=DARK["surface2"],
                        insertbackground=DARK["text"], relief="flat", font=("Segoe UI", 10),
                        command=self._notify)
@@ -654,11 +779,12 @@ class SettingsPanel(tk.Frame):
         from tkinter import colorchooser
         btn = tk.Button(parent, bg=var.get(), width=4, relief="flat", bd=0,
                         cursor="hand2")
+        # Keep the swatch in sync when the var changes (e.g. project opened)
+        var.trace_add("write", lambda *_: btn.config(bg=var.get()))
         def pick():
             c = colorchooser.askcolor(color=var.get(), parent=self)[1]
             if c:
                 var.set(c)
-                btn.config(bg=c)
                 self._notify()
         btn.config(command=pick)
         return btn
@@ -754,6 +880,7 @@ class SettingsPanel(tk.Frame):
 
         # Background image
         bg_row = tk.Frame(inner, bg=DARK["surface"])
+        self._bg_image_row = bg_row
         bg_row.pack(fill="x", padx=12, pady=3)
         tk.Label(bg_row, text="Imagem de fundo", bg=DARK["surface"], fg=DARK["text_dim"],
                  font=("Segoe UI", 9), width=18, anchor="w").pack(side="left")
@@ -772,7 +899,7 @@ class SettingsPanel(tk.Frame):
         self._section("🎬 Vídeo")
 
         self.fade_var = tk.DoubleVar(value=p.fade_duration)
-        self._row(inner, "Fade (seg)", lambda f: self._spin(f, self.fade_var, 0.1, 5.0, 7))
+        self._row(inner, "Fade (seg)", lambda f: self._spin(f, self.fade_var, 0.1, 5.0, 7, 0.1))
 
         self.fps_var = tk.IntVar(value=p.fps)
         self._row(inner, "FPS", lambda f: self._spin(f, self.fps_var, 10, 60))
@@ -785,7 +912,7 @@ class SettingsPanel(tk.Frame):
         res_menu = ttk.Combobox(res_frame, textvariable=self.res_var,
                                 values=["1920x1080", "1280x720", "3840x2160"],
                                 state="readonly", width=12, font=("Segoe UI", 10))
-        res_menu.set(f"{p.video_width}x{p.video_height}")
+        self.res_var.set(f"{p.video_width}x{p.video_height}")
         res_menu.pack(side="left")
         res_menu.bind("<<ComboboxSelected>>", lambda _: self._notify())
 
@@ -800,10 +927,28 @@ class SettingsPanel(tk.Frame):
         if self.transparent_var.get():
             self._bg_color_row.pack_forget()
         else:
-            self._bg_color_row.pack(fill="x", padx=12, pady=3,
-                                    before=self._bg_color_row.master.winfo_children()[
-                                        list(self._bg_color_row.master.winfo_children()).index(self._bg_color_row)
-                                    ] if self._bg_color_row.winfo_ismapped() else self._bg_color_row)
+            self._bg_color_row.pack(fill="x", padx=12, pady=3, before=self._bg_image_row)
+
+    def load(self, project: Project):
+        """Point the panel at another project and show its values."""
+        self.project = project
+        p = project
+        self.title_var.set(p.title)
+        self.audio_var.set(p.audio_file)
+        self.title_font_var.set(p.title_font)
+        self.title_size_var.set(p.title_size)
+        self.lyric_font_var.set(p.lyric_font)
+        self.lyric_size_var.set(p.lyric_size)
+        self.line_spacing_var.set(p.line_spacing)
+        self.title_color_var.set(p.title_color)
+        self.text_color_var.set(p.text_color)
+        self.transparent_var.set(p.transparent_bg)
+        self.bg_color_var.set(p.bg_color)
+        self.bg_image_var.set(p.bg_image)
+        self.fade_var.set(p.fade_duration)
+        self.fps_var.set(p.fps)
+        self.res_var.set(f"{p.video_width}x{p.video_height}")
+        self._on_transparent_toggle()
 
     def _pick_audio(self):
         path = filedialog.askopenfilename(
@@ -824,16 +969,31 @@ class SettingsPanel(tk.Frame):
             self._on_transparent_toggle()
             self._notify()
 
-    def _apply(self):
+    def _apply(self) -> bool:
+        """Copy the form into the project. Returns False if a field is invalid."""
+        try:
+            title_size   = int(self.title_size_var.get())
+            lyric_size   = int(self.lyric_size_var.get())
+            line_spacing = int(self.line_spacing_var.get())
+            fade         = float(self.fade_var.get())
+            fps          = int(self.fps_var.get())
+            if title_size <= 0 or lyric_size <= 0 or fps <= 0 or fade < 0 or line_spacing < 0:
+                raise ValueError
+        except (tk.TclError, ValueError):
+            messagebox.showerror("Configuração inválida",
+                                 "Confira os campos numéricos (tamanhos, espaçamento, "
+                                 "fade e FPS).", parent=self)
+            return False
+
         p = self.project
         p.title        = self.title_var.get().strip() or "Título"
         p.title_font   = self.title_font_var.get().strip() or "mvboli"
-        p.title_size   = int(self.title_size_var.get())
+        p.title_size   = title_size
         p.lyric_font   = self.lyric_font_var.get().strip() or "mvboli"
-        p.lyric_size   = int(self.lyric_size_var.get())
-        p.line_spacing = int(self.line_spacing_var.get())
-        p.fade_duration = float(self.fade_var.get())
-        p.fps          = int(self.fps_var.get())
+        p.lyric_size   = lyric_size
+        p.line_spacing = line_spacing
+        p.fade_duration = fade
+        p.fps          = fps
         p.title_color  = self.title_color_var.get()
         p.text_color   = self.text_color_var.get()
         p.bg_color     = self.bg_color_var.get()
@@ -853,6 +1013,7 @@ class SettingsPanel(tk.Frame):
 
         if self.on_change:
             self.on_change()
+        return True
 
     def _notify(self):
         pass  # apply only on button click
@@ -939,13 +1100,8 @@ class StropheList(tk.Frame):
         top = tk.Frame(inner, bg=DARK["surface"])
         top.pack(fill="x")
 
-        def fmt(sec):
-            m = int(sec) // 60
-            sc = int(sec) % 60
-            cs = int((sec % 1) * 100)
-            return f"{m:02d}:{sc:02d}.{cs:02d}"
-
-        time_str = f"⏱  {fmt(s.start_time)}  →  {fmt(s.end_time)}   ({s.end_time - s.start_time:.1f}s)"
+        time_str = (f"⏱  {format_time(s.start_time)}  →  {format_time(s.end_time)}"
+                    f"   ({s.end_time - s.start_time:.1f}s)")
         tk.Label(top, text=time_str, bg=DARK["surface"], fg=DARK["accent"],
                  font=("Courier New", 10, "bold")).pack(side="left")
 
@@ -963,9 +1119,7 @@ class StropheList(tk.Frame):
                  wraplength=600).pack(fill="x", pady=(4, 0))
 
     def _add_strophe(self):
-        next_start = 0.0
-        if self.project.strophes:
-            next_start = max(s.end_time for s in self.project.strophes)
+        next_start, next_end = next_strophe_times(self.project.strophes)
 
         def on_save(s: Strophe):
             s.id = max((x.id for x in self.project.strophes), default=0) + 1
@@ -974,7 +1128,8 @@ class StropheList(tk.Frame):
             if self.on_change:
                 self.on_change()
 
-        StropheEditor(self, on_save=on_save)
+        StropheEditor(self, on_save=on_save,
+                      default_start=next_start, default_end=next_end)
 
     def _edit(self, sid: int):
         s = next((x for x in self.project.strophes if x.id == sid), None)
@@ -1066,45 +1221,16 @@ class PasteBlockDialog(tk.Toplevel):
             messagebox.showerror("Erro", "O campo está vazio.", parent=self)
             return
 
-        blocks = re.split(r"\n\s*\n", raw)
-        imported = 0
-        errors = []
         next_id = max((s.id for s in self.project.strophes), default=0) + 1
-
-        time_pattern = re.compile(
-            r"^(\d{1,2}:\d{2}(?:\.\d+)?)\s*[-–—]\s*(\d{1,2}:\d{2}(?:\.\d+)?)"
-        )
-
-        for block in blocks:
-            block = block.strip()
-            if not block:
-                continue
-            lines = block.split("\n")
-            first = lines[0].strip()
-            m = time_pattern.match(first)
-            if not m:
-                errors.append(f"Linha sem tempo reconhecido: '{first[:40]}'")
-                continue
-            try:
-                start = parse_time(m.group(1))
-                end = parse_time(m.group(2))
-            except ValueError as e:
-                errors.append(str(e))
-                continue
-
-            text_lines = [l for l in lines[1:] if l.strip()]
-            if not text_lines:
-                errors.append(f"Estrofe em {m.group(0)}: sem letra.")
-                continue
-
-            text = "\n".join(l.strip() for l in text_lines)
-            self.project.strophes.append(Strophe(id=next_id, start_time=start, end_time=end, text=text))
-            next_id += 1
-            imported += 1
+        new_strophes, errors = parse_lyrics_block(raw, next_id)
+        self.project.strophes.extend(new_strophes)
+        imported = len(new_strophes)
 
         if errors:
             msg = f"Importadas: {imported}\n\nErros ({len(errors)}):\n" + "\n".join(errors[:5])
             messagebox.showwarning("Importação parcial", msg, parent=self)
+            if not imported:
+                return  # keep the dialog (and the pasted text) open to fix it
         else:
             messagebox.showinfo("Sucesso", f"{imported} estrofe(s) importada(s)!", parent=self)
 
@@ -1122,6 +1248,8 @@ class RenderDialog(tk.Toplevel):
         self.configure(bg=DARK["bg"])
         self.resizable(False, False)
         self.grab_set()
+        # Closing the window must stop the render too
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
         self._build()
         self.transient(parent)
         self.update_idletasks()
@@ -1142,7 +1270,7 @@ class RenderDialog(tk.Toplevel):
         row.pack(fill="x", pady=(4, 0))
 
         default_out = self.project.output_file or os.path.join(
-            os.path.expanduser("~"), f"{self.project.title or 'video'}.mp4"
+            os.path.expanduser("~"), f"{safe_filename(self.project.title)}.mp4"
         )
         self.out_var = tk.StringVar(value=default_out)
         e = tk.Entry(row, textvariable=self.out_var, bg=DARK["entry_bg"], fg=DARK["text"],
@@ -1187,7 +1315,7 @@ class RenderDialog(tk.Toplevel):
             defaultextension=".mp4",
             filetypes=[("MP4 Video", "*.mp4"), ("WebM transparente", "*.webm"),
                        ("Todos", "*.*")],
-            initialfile=f"{self.project.title or 'video'}.mp4"
+            initialfile=f"{safe_filename(self.project.title)}.mp4"
         )
         if path:
             self.out_var.set(path)
@@ -1212,22 +1340,37 @@ class RenderDialog(tk.Toplevel):
         self.cancel_btn.config(text="⏹  Parar")
         self.cancelled = False
 
-        renderer = FrameRenderer(self.project)
+        try:
+            renderer = FrameRenderer(self.project)
+        except Exception as e:
+            self.render_btn.config(state="normal")
+            messagebox.showerror("Erro", f"Não foi possível preparar o render:\n{e}", parent=self)
+            return
 
         # IMPORTANT: never touch tkinter widgets from background thread on Windows.
         # Use after() to post updates back to the main thread.
+        def post(fn):
+            try:
+                self.after(0, fn)
+            except (tk.TclError, RuntimeError):
+                pass  # dialog was closed while rendering
+
         def progress(p):
             pct = int(p * 100)
-            self.after(0, lambda v=pct: self._set_progress(v))
+            post(lambda v=pct: self._set_progress(v))
 
         def run():
-            ok, msg = renderer.render_video(
-                out,
-                audio_path=self.project.audio_file,
-                progress_callback=progress,
-                cancel_flag=lambda: self.cancelled,
-            )
-            self.after(0, lambda: self._on_done(ok, msg))
+            try:
+                ok, msg = renderer.render_video(
+                    out,
+                    audio_path=self.project.audio_file,
+                    progress_callback=progress,
+                    cancel_flag=lambda: self.cancelled,
+                )
+            except Exception as e:
+                ok, msg = False, f"Erro inesperado: {e}"
+            if not self.cancelled:
+                post(lambda: self._on_done(ok, msg))
 
         threading.Thread(target=run, daemon=True).start()
         self.progress_label.config(text="Iniciando…")
@@ -1361,17 +1504,16 @@ class App(tk.Tk):
 
     def _new_project(self):
         if messagebox.askyesno("Novo projeto", "Descartar projeto atual e criar novo?"):
-            self.project = Project()
-            self._current_file = None
-            self.settings.destroy()
-            self.strophe_list.destroy()
-            self._build_ui_panels()
+            self._load_project(Project(), None)
 
-    def _build_ui_panels(self):
-        # Re-instantiate panels after new project
-        for w in self.winfo_children():
-            if isinstance(w, (SettingsPanel, StropheList)):
-                w.destroy()
+    def _load_project(self, project: Project, path: Optional[str]):
+        """Swap the current project and refresh both panels."""
+        self.project = project
+        self._current_file = path
+        self.settings.load(project)
+        self.strophe_list.project = project
+        self.strophe_list.refresh()
+        self._on_project_change()
 
     def _open_project(self):
         path = filedialog.askopenfilename(filetypes=[("LyricRenderer", "*.lyr"),
@@ -1381,14 +1523,7 @@ class App(tk.Tk):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            self.project = Project.from_dict(data)
-            self._current_file = path
-            # Refresh UI
-            self.settings.project = self.project
-            self.settings._apply()
-            self.strophe_list.project = self.project
-            self.strophe_list.refresh()
-            self._on_project_change()
+            self._load_project(Project.from_dict(data), path)
         except Exception as e:
             messagebox.showerror("Erro", f"Não foi possível abrir:\n{e}")
 
@@ -1402,14 +1537,15 @@ class App(tk.Tk):
         path = filedialog.asksaveasfilename(
             defaultextension=".lyr",
             filetypes=[("LyricRenderer", "*.lyr"), ("JSON", "*.json")],
-            initialfile=f"{self.project.title}.lyr"
+            initialfile=f"{safe_filename(self.project.title)}.lyr"
         )
         if path:
             self._current_file = path
             self._do_save(path)
 
     def _do_save(self, path: str):
-        self.settings._apply()
+        if not self.settings._apply():
+            return
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self.project.to_dict(), f, ensure_ascii=False, indent=2)
@@ -1419,7 +1555,8 @@ class App(tk.Tk):
             messagebox.showerror("Erro", f"Não foi possível salvar:\n{e}")
 
     def _render(self):
-        self.settings._apply()
+        if not self.settings._apply():
+            return
         if not self.project.strophes:
             messagebox.showwarning("Aviso", "Adicione ao menos uma estrofe antes de renderizar.")
             return
