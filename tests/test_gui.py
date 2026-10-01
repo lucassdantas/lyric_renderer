@@ -4,6 +4,7 @@ import os
 import tempfile
 import tkinter as tk
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import lyric_renderer as lr
@@ -14,6 +15,98 @@ try:
     HAS_TK = True
 except tk.TclError:
     HAS_TK = False
+
+
+def key(keysym, char="", state=0):
+    return SimpleNamespace(keysym=keysym, char=char, state=state)
+
+
+def type_into(time_entry, text):
+    """Simulate clicking into a TimeEntry and typing."""
+    time_entry._on_focus_in()
+    results = [time_entry._on_key(key(c, c)) for c in text]
+    return results
+
+
+@unittest.skipUnless(HAS_TK, "Tk sem display disponível")
+class TimeEntryTest(unittest.TestCase):
+    def setUp(self):
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.t = lr.TimeEntry(self.root, 21)
+
+    def tearDown(self):
+        self.root.destroy()
+
+    def test_bank_style_mask(self):
+        self.assertEqual(self.t.var.get(), "00:21")
+        shown = []
+        self.t._on_focus_in()
+        for c in "1305":
+            self.t._on_key(key(c, c))
+            shown.append(self.t.var.get())
+        self.assertEqual(shown, ["00:01", "00:13", "01:30", "13:05"])
+        self.assertEqual(self.t.get_seconds(), 13 * 60 + 5)
+
+    def test_first_digit_after_focus_replaces_value(self):
+        type_into(self.t, "45")
+        self.assertEqual(self.t.var.get(), "00:45")
+
+    def test_max_four_digits(self):
+        type_into(self.t, "99599")
+        self.assertEqual(self.t.var.get(), "99:59")
+
+    def test_letters_and_symbols_are_blocked(self):
+        results = type_into(self.t, "1a:.")
+        self.assertEqual(self.t.var.get(), "00:01")
+        self.assertTrue(all(r == "break" for r in results))
+
+    def test_backspace_and_delete(self):
+        type_into(self.t, "130")
+        self.t._on_key(key("BackSpace"))
+        self.assertEqual(self.t.var.get(), "00:13")
+        self.t._on_key(key("Delete"))
+        self.assertEqual(self.t.var.get(), "00:00")
+
+    def test_arrows_step_one_second(self):
+        self.t._on_key(key("Up"))
+        self.assertEqual(self.t.var.get(), "00:22")
+        self.t.step(-1)
+        self.t.step(-1)
+        self.assertEqual(self.t.var.get(), "00:20")
+        self.t.set_seconds(59)
+        self.t.step(1)
+        self.assertEqual(self.t.var.get(), "01:00")
+        self.t.set_seconds(0)
+        self.t.step(-1)
+        self.assertEqual(self.t.var.get(), "00:00")
+
+    def test_invalid_seconds_are_red_then_normalized(self):
+        type_into(self.t, "190")
+        self.assertEqual(self.t.var.get(), "01:90")
+        self.assertFalse(self.t.is_valid())
+        self.assertEqual(self.t.entry.cget("fg"), lr.DARK["accent"])
+        self.t._on_focus_out()
+        self.assertEqual(self.t.var.get(), "02:30")
+        self.assertEqual(self.t.get_seconds(), 150)
+
+    def test_paste_keeps_only_digits(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append("01:30")
+        self.t._on_paste()
+        self.assertEqual(self.t.var.get(), "01:30")
+
+    def test_control_shortcuts_pass_through(self):
+        self.assertIsNone(self.t._on_key(key("s", "\x13", state=0x4)))
+        self.assertIsNone(self.t._on_key(key("Tab")))
+
+    def test_untouched_fraction_is_kept(self):
+        # old projects may have 21.5s: don't lose it if the field isn't edited
+        self.t.set_seconds(21.5)
+        self.assertEqual(self.t.var.get(), "00:21")
+        self.assertEqual(self.t.get_seconds(), 21.5)
+        self.t.step(1)
+        self.assertEqual(self.t.get_seconds(), 22)
 
 
 @unittest.skipUnless(HAS_TK, "Tk sem display disponível")
@@ -86,10 +179,10 @@ class AppTest(unittest.TestCase):
     def test_new_strophe_starts_after_last_one(self):
         self.app.project.strophes += [lr.Strophe(1, 0, 10, "a"), lr.Strophe(2, 11, 20, "b")]
         editor = self._open_new_strophe_editor()
-        self.assertEqual((editor.start_var.get(), editor.end_var.get()),
-                         ("00:21.00", "00:30.00"))
+        self.assertEqual((editor.start_entry.var.get(), editor.end_entry.var.get()),
+                         ("00:21", "00:30"))
         # still editable, and the same start as the previous end is allowed
-        editor.start_var.set("00:20")
+        type_into(editor.start_entry, "20")
         editor.text_widget.insert("1.0", "c")
         editor._save()
         self.assertEqual(self.app.project.strophes[-1].start_time, 20)
@@ -100,8 +193,8 @@ class AppTest(unittest.TestCase):
         with mock.patch.object(lr.messagebox, "askyesno", return_value=True):
             self.app.strophe_list._delete(3)
         editor = self._open_new_strophe_editor()
-        self.assertEqual((editor.start_var.get(), editor.end_var.get()),
-                         ("00:21.00", "00:30.00"))
+        self.assertEqual((editor.start_entry.var.get(), editor.end_entry.var.get()),
+                         ("00:21", "00:30"))
         editor.destroy()
 
     def test_save_writes_project(self):

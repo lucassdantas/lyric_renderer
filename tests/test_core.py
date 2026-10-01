@@ -42,6 +42,27 @@ class FormatTimeTest(unittest.TestCase):
         self.assertAlmostEqual(s.duration(), 7.7)
 
 
+class TimeMaskTest(unittest.TestCase):
+    def test_mask(self):
+        self.assertEqual(lr.mask_time_digits(""), "00:00")
+        self.assertEqual(lr.mask_time_digits("1"), "00:01")
+        self.assertEqual(lr.mask_time_digits("10"), "00:10")
+        self.assertEqual(lr.mask_time_digits("100"), "01:00")
+        self.assertEqual(lr.mask_time_digits("1000"), "10:00")
+
+    def test_digits_to_seconds(self):
+        self.assertEqual(lr.time_digits_to_seconds(""), 0)
+        self.assertEqual(lr.time_digits_to_seconds("130"), 90)
+        self.assertEqual(lr.time_digits_to_seconds("190"), 150)  # 01:90 → 2:30
+
+    def test_seconds_to_digits(self):
+        self.assertEqual(lr.seconds_to_time_digits(0), "")
+        self.assertEqual(lr.seconds_to_time_digits(90), "130")
+        self.assertEqual(lr.seconds_to_time_digits(21.9), "21")  # whole seconds
+        self.assertEqual(lr.seconds_to_time_digits(-5), "")
+        self.assertEqual(lr.seconds_to_time_digits(10 ** 6), "9959")
+
+
 class HelpersTest(unittest.TestCase):
     def test_hex_to_rgb(self):
         self.assertEqual(lr.hex_to_rgb("#FF8000"), (255, 128, 0))

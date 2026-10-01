@@ -113,6 +113,30 @@ def format_time(seconds: float) -> str:
     return f"{m:02d}:{s:02d}.{cs:02d}"
 
 
+TIME_MASK_DIGITS = 4                # MM:SS → up to 99:59
+TIME_MASK_MAX_SECONDS = 99 * 60 + 59
+
+
+def mask_time_digits(digits: str) -> str:
+    """Bank-style mask: typed digits fill MM:SS from the right.
+    '' → 00:00, '5' → 00:05, '130' → 01:30, '1000' → 10:00."""
+    d = digits[-TIME_MASK_DIGITS:].rjust(TIME_MASK_DIGITS, "0")
+    return f"{d[:2]}:{d[2:]}"
+
+
+def time_digits_to_seconds(digits: str) -> int:
+    """'130' → 90. Seconds above 59 still count ('190' → 150)."""
+    d = digits[-TIME_MASK_DIGITS:].rjust(TIME_MASK_DIGITS, "0")
+    return int(d[:2]) * 60 + int(d[2:])
+
+
+def seconds_to_time_digits(seconds: float) -> str:
+    """90 → '130' (whole seconds, clamped to 00:00–99:59)."""
+    total = min(max(int(seconds), 0), TIME_MASK_MAX_SECONDS)
+    m, s = divmod(total, 60)
+    return f"{m:02d}{s:02d}".lstrip("0")
+
+
 def safe_filename(name: str) -> str:
     """Strip characters that are invalid in Windows/Unix file names."""
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name).strip().rstrip(".")
@@ -615,6 +639,135 @@ class StyledButton(tk.Button):
             return hex_color
 
 
+class TimeEntry(tk.Frame):
+    """
+    MM:SS field with a bank-style mask: only digits are accepted and they
+    fill from the right (1 → 00:01, 130 → 01:30). The first digit typed after
+    focusing replaces the old value. ↑/↓ keys, the arrow buttons and the mouse
+    wheel change it by 1s. Seconds ≥ 60 show in red and are normalized
+    (01:90 → 02:30) when leaving the field or reading the value.
+    """
+    _PASS_KEYS = {"Tab", "ISO_Left_Tab", "Return", "KP_Enter", "Escape"}
+
+    def __init__(self, parent, seconds: float = 0.0):
+        super().__init__(parent, bg=DARK["bg"])
+        self.var = tk.StringVar()
+        self._digits = ""
+        self._exact = None   # untouched value, keeps fractions from old projects
+        self._fresh = False  # next digit replaces the value
+
+        self.entry = tk.Entry(self, textvariable=self.var, width=6, justify="center",
+                              bg=DARK["entry_bg"], fg=DARK["text"],
+                              insertbackground=DARK["text"], relief="flat",
+                              font=("Consolas", 12), bd=4)
+        self.entry.pack(side="left")
+
+        arrows = tk.Frame(self, bg=DARK["bg"])
+        arrows.pack(side="left", padx=(2, 0), fill="y")
+        for text, step in (("▲", 1), ("▼", -1)):
+            tk.Button(arrows, text=text, command=lambda s=step: self.step(s),
+                      font=("Segoe UI", 6), width=2, pady=0, bd=0, relief="flat",
+                      bg=DARK["surface2"], fg=DARK["text"],
+                      activebackground=DARK["accent2"], activeforeground="#fff",
+                      repeatdelay=400, repeatinterval=80, cursor="hand2",
+                      takefocus=False).pack(fill="both", expand=True,
+                                            pady=(0, 1) if step == 1 else 0)
+
+        self.entry.bind("<KeyPress>", self._on_key)
+        self.entry.bind("<<Paste>>", self._on_paste)
+        for ev in ("<<Cut>>", "<<Clear>>", "<<PasteSelection>>"):
+            self.entry.bind(ev, lambda e: "break")
+        self.entry.bind("<FocusIn>", self._on_focus_in)
+        self.entry.bind("<FocusOut>", self._on_focus_out)
+        self.entry.bind("<MouseWheel>", lambda e: self.step(1 if e.delta > 0 else -1))
+        self.entry.bind("<Button-4>", lambda e: self.step(1))
+        self.entry.bind("<Button-5>", lambda e: self.step(-1))
+
+        self.set_seconds(seconds)
+
+    # ── Value ─────────────────────────────────────────────
+
+    def set_seconds(self, seconds: float):
+        self._exact = float(seconds)
+        self._digits = seconds_to_time_digits(seconds)
+        self._render()
+
+    def get_seconds(self) -> float:
+        self.normalize()
+        if self._exact is not None:
+            return self._exact
+        return float(time_digits_to_seconds(self._digits))
+
+    def is_valid(self) -> bool:
+        return int(mask_time_digits(self._digits)[3:]) < 60
+
+    def normalize(self):
+        if not self.is_valid():
+            self._set_digits(seconds_to_time_digits(time_digits_to_seconds(self._digits)))
+
+    def step(self, delta: int):
+        current = self._exact if self._exact is not None else time_digits_to_seconds(self._digits)
+        total = min(max(int(current) + delta, 0), TIME_MASK_MAX_SECONDS)
+        self._fresh = False
+        self._set_digits(seconds_to_time_digits(total))
+        return "break"
+
+    def _set_digits(self, digits: str):
+        self._digits = digits.lstrip("0")
+        self._exact = None
+        self._render()
+
+    def _render(self):
+        self.var.set(mask_time_digits(self._digits))
+        self.entry.config(fg=DARK["text"] if self.is_valid() else DARK["accent"])
+        self.entry.icursor("end")
+
+    # ── Events ────────────────────────────────────────────
+
+    def _on_key(self, e):
+        if e.keysym in ("Up", "Down"):
+            return self.step(1 if e.keysym == "Up" else -1)
+        if e.keysym in self._PASS_KEYS:
+            return None
+        if e.state & 0x4:  # Control: let shortcuts (Ctrl+S…) through, then undo any edit
+            self.after_idle(self._render)
+            return None
+        if e.char and e.char in "0123456789":
+            digits = "" if self._fresh else self._digits
+            self._fresh = False
+            if len(digits) < TIME_MASK_DIGITS:
+                self._set_digits(digits + e.char)
+            else:
+                self._render()
+        elif e.keysym == "BackSpace":
+            self._fresh = False
+            self._set_digits(self._digits[:-1])
+        elif e.keysym == "Delete":
+            self._fresh = False
+            self._set_digits("")
+        return "break"
+
+    def _on_paste(self, _e=None):
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            return "break"
+        digits = "".join(c for c in text if c in "0123456789")
+        if digits:
+            self._fresh = False
+            self._set_digits(digits.lstrip("0")[-TIME_MASK_DIGITS:])
+        return "break"
+
+    def _on_focus_in(self, _e=None):
+        self._fresh = True
+        self.after_idle(lambda: self.entry.select_range(0, "end"))
+
+    def _on_focus_out(self, _e=None):
+        self._fresh = False
+        self.entry.selection_clear()
+        self.normalize()
+
+
 class StropheEditor(tk.Toplevel):
     """Dialog to add/edit a strophe."""
     def __init__(self, parent, strophe: Optional[Strophe] = None, on_save=None,
@@ -633,8 +786,8 @@ class StropheEditor(tk.Toplevel):
         if strophe:
             self._fill(strophe)
         else:
-            self.start_var.set(format_time(default_start))
-            self.end_var.set(format_time(default_end))
+            self.start_entry.set_seconds(default_start)
+            self.end_entry.set_seconds(default_end)
 
         self.transient(parent)
         self.update_idletasks()
@@ -661,20 +814,16 @@ class StropheEditor(tk.Toplevel):
 
         tk.Label(time_frame, text="Início (MM:SS)", bg=DARK["bg"], fg=DARK["text_dim"],
                  font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w", padx=(0, 16))
-        self.start_var = tk.StringVar(value="00:00")
-        e1 = self._entry(time_frame, width=10)
-        e1.config(textvariable=self.start_var)
-        e1.grid(row=1, column=0, padx=(0, 16))
+        self.start_entry = TimeEntry(time_frame, 0)
+        self.start_entry.grid(row=1, column=0, padx=(0, 16), sticky="w")
 
         tk.Label(time_frame, text="Fim (MM:SS)", bg=DARK["bg"], fg=DARK["text_dim"],
                  font=("Segoe UI", 9)).grid(row=0, column=1, sticky="w")
-        self.end_var = tk.StringVar(value="00:10")
-        e2 = self._entry(time_frame, width=10)
-        e2.config(textvariable=self.end_var)
-        e2.grid(row=1, column=1)
+        self.end_entry = TimeEntry(time_frame, 10)
+        self.end_entry.grid(row=1, column=1, sticky="w")
 
         # Tip
-        tk.Label(self, text="Formatos aceitos: 00:05  |  00:05.50  |  1:30",
+        tk.Label(self, text="Digite só os números (ex.: 130 = 01:30)  |  ▲▼, setas ou roda do mouse: ±1s",
                  bg=DARK["bg"], fg=DARK["text_dim"], font=("Segoe UI", 8)).pack(
             anchor="w", padx=16)
 
@@ -701,18 +850,14 @@ class StropheEditor(tk.Toplevel):
         StyledButton(btn_frame, "✓  Salvar Estrofe", command=self._save).pack(side="right")
 
     def _fill(self, s: Strophe):
-        self.start_var.set(format_time(s.start_time))
-        self.end_var.set(format_time(s.end_time))
+        self.start_entry.set_seconds(s.start_time)
+        self.end_entry.set_seconds(s.end_time)
         self.text_widget.delete("1.0", "end")
         self.text_widget.insert("1.0", s.text)
 
     def _save(self):
-        try:
-            start = parse_time(self.start_var.get())
-            end = parse_time(self.end_var.get())
-        except ValueError as e:
-            messagebox.showerror("Erro de tempo", str(e), parent=self)
-            return
+        start = self.start_entry.get_seconds()
+        end = self.end_entry.get_seconds()
 
         if end <= start:
             messagebox.showerror("Erro", "O fim deve ser após o início.", parent=self)
