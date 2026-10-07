@@ -135,6 +135,28 @@ class NextStropheTimesTest(unittest.TestCase):
         self.assertEqual(lr.next_strophe_times(s), (41.5, 50.5))
 
 
+class MergeWithNextTest(unittest.TestCase):
+    def setUp(self):
+        # inserted out of order on purpose: merge follows time order
+        self.s = [lr.Strophe(3, 20, 25, "e\nf"), lr.Strophe(1, 0, 5, "a\nb"),
+                  lr.Strophe(2, 10, 15, "c\nd")]
+
+    def test_merge_two_line_pairs_into_four(self):
+        res = lr.merge_with_next(self.s, 1)
+        self.assertEqual([(x.id, x.start_time, x.end_time, x.text) for x in res],
+                         [(1, 0, 15, "a\nb\nc\nd"), (3, 20, 25, "e\nf")])
+
+    def test_merge_again_keeps_growing(self):
+        res = lr.merge_with_next(lr.merge_with_next(self.s, 1), 1)
+        self.assertEqual([(x.start_time, x.end_time, x.text) for x in res],
+                         [(0, 25, "a\nb\nc\nd\ne\nf")])
+
+    def test_last_or_missing_is_unchanged(self):
+        self.assertEqual(len(lr.merge_with_next(self.s, 3)), 3)
+        self.assertEqual(len(lr.merge_with_next(self.s, 99)), 3)
+        self.assertEqual(lr.merge_with_next([], 1), [])
+
+
 class ProjectSerializationTest(unittest.TestCase):
     def test_round_trip(self):
         p = lr.Project(title="Minha Música", lyric_size=40, transparent_bg=False,

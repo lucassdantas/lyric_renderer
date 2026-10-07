@@ -3,21 +3,20 @@
 LyricRenderer — Instalador/Lançador
 Verifica dependências e inicia o app.
 """
+import importlib.util
 import subprocess
 import sys
 import os
 
 # pip package name -> import name
-REQUIRED = {"Pillow": "PIL"}
+REQUIRED = {"Pillow": "PIL", "faster-whisper": "faster_whisper"}
 
 def check_deps():
-    missing = []
-    for pkg, module in REQUIRED.items():
-        try:
-            __import__(module)
-        except ImportError:
-            missing.append(pkg)
-    return missing
+    # find_spec checks the package is installed without importing it
+    # (importing faster-whisper can fail when Windows blocks PyAV, which
+    # the app works around — reinstalling wouldn't help)
+    return [pkg for pkg, module in REQUIRED.items()
+            if importlib.util.find_spec(module) is None]
 
 def install(pkgs):
     base = [sys.executable, "-m", "pip", "install", *pkgs]

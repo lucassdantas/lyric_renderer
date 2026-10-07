@@ -11,6 +11,7 @@ import os
 import sys
 import subprocess
 import threading
+import queue
 import re
 import struct
 import zlib
@@ -18,6 +19,8 @@ from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 import colorsys
+
+import auto_lyrics
 
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -184,6 +187,24 @@ def parse_lyrics_block(raw: str, next_id: int = 1):
                                 text="\n".join(text_lines)))
         next_id += 1
     return strophes, errors
+
+
+def merge_with_next(strophes: List[Strophe], sid: int) -> List[Strophe]:
+    """
+    Join strophe `sid` with the one right after it (in time order): start of the
+    first, end of the second, text of both. Returns the new list sorted by time;
+    unchanged if `sid` is the last one or doesn't exist.
+    """
+    ordered = sorted(strophes, key=lambda s: s.start_time)
+    idx = next((i for i, s in enumerate(ordered) if s.id == sid), None)
+    if idx is None or idx + 1 >= len(ordered):
+        return ordered
+    a, b = ordered[idx], ordered[idx + 1]
+    merged = Strophe(id=a.id,
+                     start_time=min(a.start_time, b.start_time),
+                     end_time=max(a.end_time, b.end_time),
+                     text=a.text.strip() + "\n" + b.text.strip())
+    return ordered[:idx] + [merged] + ordered[idx + 2:]
 
 
 def next_strophe_times(strophes):
@@ -528,6 +549,13 @@ class FrameRenderer:
         except FileNotFoundError:
             return False, ("FFmpeg não encontrado. Instale o FFmpeg e "
                            "garanta que ele está no PATH.")
+        except OSError as e:
+            if getattr(e, "winerror", None) == 4551:
+                return False, ("O Windows bloqueou o FFmpeg (Smart App Control / "
+                               "Controle de Aplicativo).\n\n"
+                               "Veja em: Segurança do Windows → Controle de aplicativos "
+                               "e navegador → Smart App Control.")
+            return False, f"Não foi possível iniciar o FFmpeg:\n{e}"
 
         # Drain stderr in background to prevent Windows pipe deadlock
         stderr_lines = []
@@ -605,6 +633,34 @@ DARK = {
 }
 
 
+def bind_wheel_scroll(canvas: tk.Canvas):
+    """
+    Scroll `canvas` with the mouse wheel while the pointer is over it or over
+    anything inside it (cards, labels, buttons…). Wheel events go to the widget
+    under the pointer, so a binding on the canvas alone only works on its empty
+    areas — this listens app-wide and filters by widget path instead.
+    """
+    path = str(canvas)
+
+    def on_wheel(e, step=None):
+        w = str(e.widget)
+        if w != path and not w.startswith(path + "."):
+            return
+        try:
+            top, bottom = canvas.yview()
+            if top <= 0 and bottom >= 1:
+                return  # everything fits, nothing to scroll
+            if step is None:
+                step = -int(e.delta / 120) or (-1 if e.delta > 0 else 1)
+            canvas.yview_scroll(step, "units")
+        except tk.TclError:
+            pass  # canvas destroyed
+
+    canvas.bind_all("<MouseWheel>", on_wheel, add="+")
+    canvas.bind_all("<Button-4>", lambda e: on_wheel(e, -1), add="+")  # Linux
+    canvas.bind_all("<Button-5>", lambda e: on_wheel(e, 1), add="+")
+
+
 class StyledButton(tk.Button):
     def __init__(self, parent, text, command=None, style="primary", **kwargs):
         colors = {
@@ -655,6 +711,7 @@ class TimeEntry(tk.Frame):
         self._digits = ""
         self._exact = None   # untouched value, keeps fractions from old projects
         self._fresh = False  # next digit replaces the value
+        self._pending = set()  # after_idle jobs to cancel on destroy
 
         self.entry = tk.Entry(self, textvariable=self.var, width=6, justify="center",
                               bg=DARK["entry_bg"], fg=DARK["text"],
@@ -730,7 +787,7 @@ class TimeEntry(tk.Frame):
         if e.keysym in self._PASS_KEYS:
             return None
         if e.state & 0x4:  # Control: let shortcuts (Ctrl+S…) through, then undo any edit
-            self.after_idle(self._render)
+            self._later(self._render)
             return None
         if e.char and e.char in "0123456789":
             digits = "" if self._fresh else self._digits
@@ -760,7 +817,20 @@ class TimeEntry(tk.Frame):
 
     def _on_focus_in(self, _e=None):
         self._fresh = True
-        self.after_idle(lambda: self.entry.select_range(0, "end"))
+        self._later(lambda: self.entry.select_range(0, "end"))
+
+    def _later(self, fn):
+        """after_idle that is cancelled if the field is destroyed first."""
+        self._pending.add(self.after_idle(fn))
+
+    def destroy(self):
+        for job in self._pending:
+            try:
+                self.after_cancel(job)
+            except tk.TclError:
+                pass
+        self._pending.clear()
+        super().destroy()
 
     def _on_focus_out(self, _e=None):
         self._fresh = False
@@ -947,10 +1017,7 @@ class SettingsPanel(tk.Frame):
         win_id = outer.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda e: outer.configure(scrollregion=outer.bbox("all")))
         outer.bind("<Configure>", lambda e: outer.itemconfig(win_id, width=e.width))
-        for widget in (outer, inner):
-            widget.bind("<MouseWheel>", lambda e: outer.yview_scroll(-1*(e.delta//120), "units"))
-            widget.bind("<Button-4>",   lambda e: outer.yview_scroll(-1, "units"))
-            widget.bind("<Button-5>",   lambda e: outer.yview_scroll( 1, "units"))
+        bind_wheel_scroll(outer)
         self._inner = inner  # all sub-widgets go here
 
         # ── Song settings ──────────────────────────────────
@@ -1165,10 +1232,11 @@ class SettingsPanel(tk.Frame):
 
 
 class StropheList(tk.Frame):
-    def __init__(self, parent, project: Project, on_change=None):
+    def __init__(self, parent, project: Project, on_change=None, on_auto_lyrics=None):
         super().__init__(parent, bg=DARK["bg"])
         self.project = project
         self.on_change = on_change
+        self.on_auto_lyrics = on_auto_lyrics
         self._build()
 
     def _build(self):
@@ -1182,6 +1250,9 @@ class StropheList(tk.Frame):
                      style="primary", padx=10, pady=5).pack(side="right")
         StyledButton(hdr, "📋 Colar Bloco", command=self._paste_block,
                      style="secondary", padx=10, pady=5).pack(side="right", padx=(0, 6))
+        if self.on_auto_lyrics:
+            StyledButton(hdr, "🎤 Gerar Legenda", command=self.on_auto_lyrics,
+                         style="success", padx=10, pady=5).pack(side="right", padx=(0, 6))
 
         # Canvas + scrollbar for strophe cards
         container = tk.Frame(self, bg=DARK["bg"])
@@ -1202,9 +1273,7 @@ class StropheList(tk.Frame):
         scrollbar.pack(side="right", fill="y")
 
         # Mousewheel
-        self.canvas.bind("<MouseWheel>", lambda e: self.canvas.yview_scroll(-1*(e.delta//120), "units"))
-        self.canvas.bind("<Button-4>", lambda e: self.canvas.yview_scroll(-1, "units"))
-        self.canvas.bind("<Button-5>", lambda e: self.canvas.yview_scroll(1, "units"))
+        bind_wheel_scroll(self.canvas)
 
         self.canvas.bind("<Configure>", self._on_canvas_resize)
 
@@ -1227,9 +1296,9 @@ class StropheList(tk.Frame):
             return
 
         for i, s in enumerate(strophes):
-            self._strophe_card(self.scrollable_frame, s, i)
+            self._strophe_card(self.scrollable_frame, s, i, is_last=i == len(strophes) - 1)
 
-    def _strophe_card(self, parent, s: Strophe, idx: int):
+    def _strophe_card(self, parent, s: Strophe, idx: int, is_last: bool = False):
         card = tk.Frame(parent, bg=DARK["surface"], pady=0)
         card.pack(fill="x", padx=8, pady=4)
 
@@ -1245,8 +1314,10 @@ class StropheList(tk.Frame):
         top = tk.Frame(inner, bg=DARK["surface"])
         top.pack(fill="x")
 
+        n_lines = len([l for l in s.text.split("\n") if l.strip()])
         time_str = (f"⏱  {format_time(s.start_time)}  →  {format_time(s.end_time)}"
-                    f"   ({s.end_time - s.start_time:.1f}s)")
+                    f"   ({s.end_time - s.start_time:.1f}s · "
+                    f"{n_lines} linha{'s' if n_lines != 1 else ''})")
         tk.Label(top, text=time_str, bg=DARK["surface"], fg=DARK["accent"],
                  font=("Courier New", 10, "bold")).pack(side="left")
 
@@ -1256,6 +1327,10 @@ class StropheList(tk.Frame):
         StyledButton(top, "✕", command=lambda sid=s.id: self._delete(sid),
                      style="danger", padx=6, pady=2,
                      font=("Segoe UI", 9)).pack(side="right")
+        if not is_last:
+            StyledButton(top, "↓ Juntar", command=lambda sid=s.id: self._merge_next(sid),
+                         style="secondary", padx=6, pady=2,
+                         font=("Segoe UI", 9)).pack(side="right", padx=(0, 4))
 
         # Lyrics preview
         preview = s.text.strip()[:120] + ("…" if len(s.text.strip()) > 120 else "")
@@ -1290,6 +1365,13 @@ class StropheList(tk.Frame):
                 self.on_change()
 
         StropheEditor(self, strophe=s, on_save=on_save)
+
+    def _merge_next(self, sid: int):
+        """Join this strophe with the one below it."""
+        self.project.strophes = merge_with_next(self.project.strophes, sid)
+        self.refresh()
+        if self.on_change:
+            self.on_change()
 
     def _delete(self, sid: int):
         if messagebox.askyesno("Confirmar", "Remover esta estrofe?"):
@@ -1381,6 +1463,210 @@ class PasteBlockDialog(tk.Toplevel):
 
         if self.on_done:
             self.on_done()
+        self.destroy()
+
+
+class AutoLyricsDialog(tk.Toplevel):
+    """
+    Generate timed strophes from the audio with Whisper (auto_lyrics.py).
+    With lyrics pasted, the text is kept and only the timing is detected;
+    without, Whisper also writes the text.
+    """
+    LANGUAGES = {"Português": "pt", "Inglês": "en", "Espanhol": "es", "Detectar": None}
+
+    def __init__(self, parent, project: Project, on_audio_change=None, on_done=None):
+        super().__init__(parent)
+        self.project = project
+        self.on_audio_change = on_audio_change
+        self.on_done = on_done
+        self.cancelled = False
+        self.running = False
+        self.title("Gerar Legenda Automática")
+        self.configure(bg=DARK["bg"])
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self._build()
+        self.geometry("640x620")
+        self.transient(parent)
+
+    def _build(self):
+        pad = {"padx": 16}
+        tk.Label(self, text="🎤  Gerar Legenda Automática", bg=DARK["bg"], fg=DARK["text"],
+                 font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(14, 8), **pad)
+
+        # Audio
+        row = tk.Frame(self, bg=DARK["bg"])
+        row.pack(fill="x", **pad)
+        tk.Label(row, text="Áudio:", bg=DARK["bg"], fg=DARK["text_dim"],
+                 font=("Segoe UI", 9), width=8, anchor="w").pack(side="left")
+        self.audio_var = tk.StringVar(value=self.project.audio_file)
+        tk.Entry(row, textvariable=self.audio_var, bg=DARK["entry_bg"], fg=DARK["text"],
+                 insertbackground=DARK["text"], relief="flat", font=("Segoe UI", 9),
+                 bd=4).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        StyledButton(row, "...", command=self._pick_audio, style="secondary",
+                     padx=8, pady=4).pack(side="left")
+
+        # Options
+        opt = tk.Frame(self, bg=DARK["bg"])
+        opt.pack(fill="x", pady=(8, 0), **pad)
+        tk.Label(opt, text="Idioma:", bg=DARK["bg"], fg=DARK["text_dim"],
+                 font=("Segoe UI", 9), width=8, anchor="w").pack(side="left")
+        self.lang_var = tk.StringVar(value="Português")
+        ttk.Combobox(opt, textvariable=self.lang_var, values=list(self.LANGUAGES),
+                     state="readonly", width=12).pack(side="left")
+        tk.Label(opt, text="Modelo:", bg=DARK["bg"], fg=DARK["text_dim"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(16, 6))
+        self.model_var = tk.StringVar(value=auto_lyrics.MODELS[auto_lyrics.DEFAULT_MODEL])
+        ttk.Combobox(opt, textvariable=self.model_var, values=list(auto_lyrics.MODELS.values()),
+                     state="readonly", width=16).pack(side="left")
+
+        # Lyrics
+        tk.Label(self, text="Letra (opcional, mas deixa bem mais preciso):", bg=DARK["bg"],
+                 fg=DARK["text"], font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", pady=(14, 2), **pad)
+        tk.Label(self, text="Cole a letra com as estrofes separadas por linha em branco — "
+                            "o texto fica igualzinho e só os tempos são detectados.\n"
+                            "Sem letra, a IA escreve sozinha (pode errar algumas palavras).",
+                 bg=DARK["bg"], fg=DARK["text_dim"], font=("Segoe UI", 8),
+                 justify="left").pack(anchor="w", **pad)
+        tf = tk.Frame(self, bg=DARK["border"], padx=1, pady=1)
+        tf.pack(fill="both", expand=True, pady=(6, 0), **pad)
+        self.lyrics_text = tk.Text(tf, bg=DARK["entry_bg"], fg=DARK["text"],
+                                   insertbackground=DARK["text"], font=("Segoe UI", 10),
+                                   relief="flat", bd=8, wrap="word", height=10)
+        self.lyrics_text.pack(fill="both", expand=True)
+
+        # Progress
+        self.status_label = tk.Label(self, text="A primeira vez baixa o modelo (~0,5–1,5 GB).",
+                                     bg=DARK["bg"], fg=DARK["text_dim"], font=("Segoe UI", 9))
+        self.status_label.pack(anchor="w", pady=(10, 2), **pad)
+        self.progress_bar = ttk.Progressbar(self, mode="determinate")
+        self.progress_bar.pack(fill="x", **pad)
+
+        # Buttons
+        bf = tk.Frame(self, bg=DARK["bg"])
+        bf.pack(fill="x", pady=12, **pad)
+        self.cancel_btn = StyledButton(bf, "✕  Cancelar", command=self._cancel, style="secondary")
+        self.cancel_btn.pack(side="right", padx=(8, 0))
+        self.gen_btn = StyledButton(bf, "🎤  Gerar", command=self._start)
+        self.gen_btn.pack(side="right")
+
+    def _pick_audio(self):
+        path = filedialog.askopenfilename(
+            parent=self,
+            filetypes=[("Áudio", "*.mp3 *.wav *.ogg *.aac *.m4a *.flac"), ("Todos", "*.*")])
+        if path:
+            self.audio_var.set(path)
+
+    def _model_size(self) -> str:
+        label = self.model_var.get()
+        return next((k for k, v in auto_lyrics.MODELS.items() if v == label),
+                    auto_lyrics.DEFAULT_MODEL)
+
+    def _cancel(self):
+        self.cancelled = True
+        self.running = False
+        self.destroy()
+
+    def _start(self):
+        audio = self.audio_var.get().strip()
+        if not audio or not os.path.isfile(audio):
+            messagebox.showerror("Erro", "Escolha o arquivo de áudio da música.", parent=self)
+            return
+        if not auto_lyrics.is_available():
+            messagebox.showerror("Whisper não instalado",
+                                 "Instale o Whisper com:\n\n    pip install faster-whisper\n\n"
+                                 "e abra o programa de novo.", parent=self)
+            return
+        if audio != self.project.audio_file and self.on_audio_change:
+            self.on_audio_change(audio)  # also use it for the render
+
+        lyrics = self.lyrics_text.get("1.0", "end-1c")
+        model = self._model_size()
+        language = self.LANGUAGES.get(self.lang_var.get(), "pt")
+
+        self.gen_btn.config(state="disabled")
+        self.cancel_btn.config(text="⏹  Parar")
+        self.status_label.config(text="Carregando o modelo… (na primeira vez ele é baixado)")
+        self.progress_bar.config(mode="indeterminate")
+        self.progress_bar.start(12)
+        self.running = True
+
+        # The worker never touches Tk: it queues callbacks that _poll runs
+        # on the main thread.
+        events = queue.Queue()
+        post = events.put
+
+        def poll():
+            try:
+                while True:
+                    events.get_nowait()()
+            except queue.Empty:
+                pass
+            if self.running:
+                self.after(100, poll)
+
+        self.after(100, poll)
+
+        def progress(p):
+            post(lambda v=int(p * 100): self._set_progress(v))
+
+        def run():
+            try:
+                result = auto_lyrics.generate(audio, lyrics, model, language,
+                                              progress=progress,
+                                              cancel=lambda: self.cancelled)
+                outcome = (True, result)
+            except auto_lyrics.Cancelled:
+                return
+            except auto_lyrics.AutoLyricsError as e:
+                outcome = (False, str(e))
+            except Exception as e:
+                outcome = (False, f"Erro inesperado: {e}")
+            if not self.cancelled:
+                post(lambda: self._on_done(*outcome))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _set_progress(self, pct: int):
+        try:
+            if str(self.progress_bar.cget("mode")) != "determinate":
+                self.progress_bar.stop()
+                self.progress_bar.config(mode="determinate")
+            self.progress_bar["value"] = pct
+            self.status_label.config(text=f"Ouvindo a música… {pct}%")
+        except tk.TclError:
+            pass
+
+    def _on_done(self, ok: bool, result):
+        self.running = False
+        self.progress_bar.stop()
+        self.progress_bar.config(mode="determinate")
+        if not ok:
+            self.status_label.config(text="❌  Erro ao gerar a legenda", fg=DARK["accent"])
+            self.gen_btn.config(state="normal")
+            self.cancel_btn.config(text="✕  Cancelar")
+            messagebox.showerror("Erro", result, parent=self)
+            return
+        if not result:
+            self.gen_btn.config(state="normal")
+            messagebox.showwarning("Nada encontrado", "Nenhuma estrofe foi gerada.", parent=self)
+            return
+        if self.project.strophes and not messagebox.askyesno(
+                "Substituir estrofes?",
+                f"O projeto já tem {len(self.project.strophes)} estrofe(s).\n"
+                f"Substituir pelas {len(result)} geradas?", parent=self):
+            self.gen_btn.config(state="normal")
+            self.cancel_btn.config(text="✕  Cancelar")
+            return
+
+        self.project.strophes = [Strophe(id=i + 1, start_time=s.start, end_time=s.end, text=s.text)
+                                 for i, s in enumerate(result)]
+        if self.on_done:
+            self.on_done()
+        messagebox.showinfo("Pronto",
+                            f"{len(result)} estrofe(s) gerada(s)!\n\n"
+                            "Revise os tempos e o texto antes de renderizar.", parent=self)
         self.destroy()
 
 
@@ -1630,7 +1916,8 @@ class App(tk.Tk):
         paned.add(right_frame, minsize=400)
 
         self.strophe_list = StropheList(right_frame, self.project,
-                                         on_change=self._on_project_change)
+                                         on_change=self._on_project_change,
+                                         on_auto_lyrics=self._auto_lyrics)
         self.strophe_list.pack(fill="both", expand=True)
 
         # Status bar
@@ -1698,6 +1985,20 @@ class App(tk.Tk):
             self.statusbar.config(text=f"Salvo em {path}")
         except Exception as e:
             messagebox.showerror("Erro", f"Não foi possível salvar:\n{e}")
+
+    def _auto_lyrics(self):
+        if not self.settings._apply():
+            return
+
+        def on_audio_change(path):
+            self.settings.audio_var.set(path)
+            self.project.audio_file = path
+
+        def on_done():
+            self.strophe_list.refresh()
+            self._on_project_change()
+
+        AutoLyricsDialog(self, self.project, on_audio_change=on_audio_change, on_done=on_done)
 
     def _render(self):
         if not self.settings._apply():

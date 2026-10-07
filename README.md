@@ -12,7 +12,7 @@ Gerador de vídeos de letras de música — rápido, centralizado, com fade pro 
 
 ```bash
 # Instalar dependências
-pip install Pillow
+pip install -r requirements.txt
 
 # OU use o launcher que instala automaticamente:
 python run.py
@@ -40,6 +40,17 @@ python lyric_renderer.py
 2. **Estrofes** (painel direito):
    - Clique `+ Nova Estrofe` para adicionar manualmente
    - OU clique `📋 Colar Bloco` para importar várias de uma vez
+
+   - OU clique `🎤 Gerar Legenda` para gerar tudo automaticamente a partir do áudio
+
+### Gerar Legenda (automático)
+
+1. Clique `🎤 Gerar Legenda` e escolha o áudio da música (se já estiver no painel, vem preenchido)
+2. **Opcional, mas recomendado:** cole a letra (estrofes separadas por linha em branco). O texto fica exatamente igual e só os tempos são detectados. Sem letra, a IA escreve sozinha e pode errar palavras.
+3. Clique `Gerar`. A primeira vez baixa o modelo (~0,5 GB no "Rápido"); depois, uma música de 3 min leva por volta de 1 min no processador.
+4. As estrofes aparecem na lista: revise tempos e texto e renderize.
+
+Precisa do `faster-whisper` (`pip install faster-whisper`, o `run.py` instala sozinho). Roda 100% no seu PC, sem internet depois do download do modelo.
 
 ### Formato do Colar Bloco
 

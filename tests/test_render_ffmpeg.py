@@ -7,7 +7,17 @@ import unittest
 
 import lyric_renderer as lr
 
-HAS_FFMPEG = shutil.which("ffmpeg") and shutil.which("ffprobe")
+def _ffmpeg_runs():
+    """Installed AND allowed to run (Windows Smart App Control can block it)."""
+    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
+        return False
+    try:
+        return subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
+HAS_FFMPEG = _ffmpeg_runs()
 
 
 def ffprobe(path, entries):
@@ -17,7 +27,7 @@ def ffprobe(path, entries):
         capture_output=True, text=True).stdout
 
 
-@unittest.skipUnless(HAS_FFMPEG, "ffmpeg/ffprobe não encontrados")
+@unittest.skipUnless(HAS_FFMPEG, "ffmpeg/ffprobe não encontrados ou bloqueados pelo Windows")
 class FfmpegRenderTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

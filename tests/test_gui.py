@@ -197,6 +197,130 @@ class AppTest(unittest.TestCase):
                          ("00:21", "00:30"))
         editor.destroy()
 
+    def _auto_dialog(self):
+        self.app._auto_lyrics()
+        return next(w for w in self.app.winfo_children() if isinstance(w, lr.AutoLyricsDialog))
+
+    def test_auto_lyrics_fills_the_strophe_list(self):
+        dialog = self._auto_dialog()
+        result = [lr.auto_lyrics.TimedStrophe(1.2, 5.5, "linha 1\nlinha 2"),
+                  lr.auto_lyrics.TimedStrophe(6.0, 9.0, "linha 3")]
+        with mock.patch.object(lr.messagebox, "showinfo"):
+            dialog._on_done(True, result)
+        self.assertEqual([(s.id, s.start_time, s.end_time, s.text) for s in self.app.project.strophes],
+                         [(1, 1.2, 5.5, "linha 1\nlinha 2"), (2, 6.0, 9.0, "linha 3")])
+        self.assertIs(self.app.strophe_list.project, self.app.project)
+        cards = self.app.strophe_list.scrollable_frame.winfo_children()
+        self.assertEqual(len(cards), 2)
+
+    def test_auto_lyrics_asks_before_replacing(self):
+        self.app.project.strophes.append(lr.Strophe(1, 0, 2, "minha"))
+        dialog = self._auto_dialog()
+        with mock.patch.object(lr.messagebox, "askyesno", return_value=False):
+            dialog._on_done(True, [lr.auto_lyrics.TimedStrophe(1, 2, "nova")])
+        self.assertEqual([s.text for s in self.app.project.strophes], ["minha"])
+        dialog.destroy()
+
+    def test_auto_lyrics_error_is_shown(self):
+        dialog = self._auto_dialog()
+        with mock.patch.object(lr.messagebox, "showerror") as err:
+            dialog._on_done(False, "deu ruim")
+        err.assert_called_once()
+        self.assertEqual(str(dialog.gen_btn.cget("state")), "normal")
+        dialog.destroy()
+
+    def test_auto_lyrics_needs_audio(self):
+        dialog = self._auto_dialog()
+        dialog.audio_var.set("")
+        with mock.patch.object(lr.messagebox, "showerror") as err:
+            dialog._start()
+        err.assert_called_once()
+        self.assertFalse(dialog.running)
+        dialog.destroy()
+
+    def test_auto_lyrics_runs_in_background(self):
+        # the whole flow with Whisper replaced by a fake
+        audio = os.path.join(self.tmp.name, "song.wav")
+        open(audio, "wb").close()
+        dialog = self._auto_dialog()
+        dialog.audio_var.set(audio)
+        dialog.lyrics_text.insert("1.0", "oi\n\ntchau")
+        fake = [lr.auto_lyrics.TimedStrophe(1, 2, "oi"), lr.auto_lyrics.TimedStrophe(3, 4, "tchau")]
+        with mock.patch.object(lr.auto_lyrics, "is_available", return_value=True), \
+             mock.patch.object(lr.auto_lyrics, "generate", return_value=fake) as gen, \
+             mock.patch.object(lr.messagebox, "showinfo"):
+            dialog._start()
+            for _ in range(200):
+                self.app.update()
+                if not dialog.winfo_exists():
+                    break
+                self.app.after(10)
+        args = gen.call_args
+        self.assertEqual(args.args[:2], (audio, "oi\n\ntchau"))
+        self.assertEqual(self.app.project.audio_file, audio)  # reused for the render
+        self.assertEqual(self.app.settings.audio_var.get(), audio)
+        self.assertEqual([s.text for s in self.app.project.strophes], ["oi", "tchau"])
+
+    def _card_buttons(self, card):
+        top = card.winfo_children()[1].winfo_children()[0]
+        return {w.cget("text"): w for w in top.winfo_children() if isinstance(w, tk.Button)}
+
+    def test_merge_button_joins_with_next(self):
+        sl = self.app.strophe_list
+        self.app.project.strophes = [lr.Strophe(1, 0, 4, "v1\nv2"), lr.Strophe(2, 5, 9, "v3\nv4"),
+                                     lr.Strophe(3, 10, 14, "pre1\npre2")]
+        sl.refresh()
+        cards = sl.scrollable_frame.winfo_children()
+        self.assertIn("↓ Juntar", self._card_buttons(cards[0]))
+        self.assertNotIn("↓ Juntar", self._card_buttons(cards[-1]))  # nothing below the last
+
+        self._card_buttons(cards[0])["↓ Juntar"].invoke()
+        self.assertEqual([(s.start_time, s.end_time, s.text) for s in self.app.project.strophes],
+                         [(0, 9, "v1\nv2\nv3\nv4"), (10, 14, "pre1\npre2")])
+        self.assertEqual(len(sl.scrollable_frame.winfo_children()), 2)
+
+    def _wheel(self, widget, delta):
+        widget.event_generate("<MouseWheel>", delta=delta, when="now")
+        self.app.update()
+
+    def test_wheel_scrolls_strophe_list_over_cards(self):
+        sl = self.app.strophe_list
+        self.app.project.strophes = [lr.Strophe(i, i * 10, i * 10 + 5, f"linha {i}\noutra")
+                                     for i in range(1, 31)]
+        sl.refresh()
+        self.app.deiconify()  # needs real geometry to know there's something to scroll
+        self.app.update()
+        self.assertLess(sl.canvas.yview()[1], 1.0)
+
+        card = sl.scrollable_frame.winfo_children()[0]
+        lyric_label = [w for w in card.winfo_children()[1].winfo_children()
+                       if isinstance(w, tk.Label)][0]
+        self._wheel(lyric_label, -120)  # wheel down over the lyric text
+        self.assertGreater(sl.canvas.yview()[0], 0)
+        self._wheel(lyric_label, 120)
+        self.assertEqual(sl.canvas.yview()[0], 0)
+
+    def test_wheel_elsewhere_does_not_scroll_list(self):
+        sl = self.app.strophe_list
+        self.app.project.strophes = [lr.Strophe(i, i * 10, i * 10 + 5, "x\ny\nz")
+                                     for i in range(1, 31)]
+        sl.refresh()
+        self.app.deiconify()
+        self.app.update()
+        self._wheel(self.app.statusbar, -120)
+        self.assertEqual(sl.canvas.yview()[0], 0)
+
+    def test_wheel_scrolls_settings_panel_over_fields(self):
+        self.app.geometry("1000x400")  # small window, so the panel overflows
+        self.app.deiconify()
+        self.app.update()
+        sp = self.app.settings
+        canvas = sp._inner.master
+        self.assertLess(canvas.yview()[1], 1.0)
+        label = sp._bg_image_row.winfo_children()[0]
+        self._wheel(label, -120)
+        self.assertGreater(canvas.yview()[0], 0)
+
     def test_save_writes_project(self):
         path = os.path.join(self.tmp.name, "s.lyr")
         self.app.settings.title_var.set("Salvo")
