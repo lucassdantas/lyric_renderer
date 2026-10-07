@@ -1517,8 +1517,11 @@ class AutoLyricsDialog(tk.Toplevel):
         tk.Label(opt, text="Modelo:", bg=DARK["bg"], fg=DARK["text_dim"],
                  font=("Segoe UI", 9)).pack(side="left", padx=(16, 6))
         self.model_var = tk.StringVar(value=auto_lyrics.MODELS[auto_lyrics.DEFAULT_MODEL])
-        ttk.Combobox(opt, textvariable=self.model_var, values=list(auto_lyrics.MODELS.values()),
-                     state="readonly", width=16).pack(side="left")
+        model_box = ttk.Combobox(opt, textvariable=self.model_var,
+                                 values=list(auto_lyrics.MODELS.values()),
+                                 state="readonly", width=16)
+        model_box.pack(side="left")
+        model_box.bind("<<ComboboxSelected>>", lambda _: self._show_model_status())
 
         # Lyrics
         tk.Label(self, text="Letra (opcional, mas deixa bem mais preciso):", bg=DARK["bg"],
@@ -1537,8 +1540,9 @@ class AutoLyricsDialog(tk.Toplevel):
         self.lyrics_text.pack(fill="both", expand=True)
 
         # Progress
-        self.status_label = tk.Label(self, text="A primeira vez baixa o modelo (~0,5–1,5 GB).",
-                                     bg=DARK["bg"], fg=DARK["text_dim"], font=("Segoe UI", 9))
+        self.status_label = tk.Label(self, text="", bg=DARK["bg"], fg=DARK["text_dim"],
+                                     font=("Segoe UI", 9))
+        self._show_model_status()
         self.status_label.pack(anchor="w", pady=(10, 2), **pad)
         self.progress_bar = ttk.Progressbar(self, mode="determinate")
         self.progress_bar.pack(fill="x", **pad)
@@ -1557,6 +1561,15 @@ class AutoLyricsDialog(tk.Toplevel):
             filetypes=[("Áudio", "*.mp3 *.wav *.ogg *.aac *.m4a *.flac"), ("Todos", "*.*")])
         if path:
             self.audio_var.set(path)
+
+    def _show_model_status(self):
+        model = self._model_size()
+        if auto_lyrics.is_downloaded(model):
+            text = "✓ Modelo já baixado — funciona sem internet."
+        else:
+            text = (f"Este modelo ainda não foi baixado: na primeira vez ele baixa "
+                    f"{auto_lyrics.MODEL_DOWNLOAD_SIZE[model]} da internet.")
+        self.status_label.config(text=text, fg=DARK["text_dim"])
 
     def _model_size(self) -> str:
         label = self.model_var.get()
@@ -1587,7 +1600,11 @@ class AutoLyricsDialog(tk.Toplevel):
 
         self.gen_btn.config(state="disabled")
         self.cancel_btn.config(text="⏹  Parar")
-        self.status_label.config(text="Carregando o modelo… (na primeira vez ele é baixado)")
+        if auto_lyrics.is_downloaded(model):
+            self.status_label.config(text="Carregando o modelo…")
+        else:
+            self.status_label.config(text=f"Baixando o modelo "
+                                          f"({auto_lyrics.MODEL_DOWNLOAD_SIZE[model]}, só desta vez)…")
         self.progress_bar.config(mode="indeterminate")
         self.progress_bar.start(12)
         self.running = True

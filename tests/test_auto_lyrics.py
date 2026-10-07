@@ -163,6 +163,25 @@ class LoadAudioTest(unittest.TestCase):
             self.assertEqual(len(data), 1600)
 
 
+class IsDownloadedTest(unittest.TestCase):
+    def test_reads_the_hugging_face_cache(self):
+        from unittest import mock
+        import huggingface_hub
+        with mock.patch.object(huggingface_hub, "try_to_load_from_cache",
+                               return_value="C:/cache/model.bin") as f:
+            self.assertTrue(al.is_downloaded("medium"))
+            f.assert_called_with("Systran/faster-whisper-medium", "model.bin")
+        with mock.patch.object(huggingface_hub, "try_to_load_from_cache", return_value=None):
+            self.assertFalse(al.is_downloaded("medium"))
+        with mock.patch.object(huggingface_hub, "try_to_load_from_cache", return_value=object()):
+            self.assertFalse(al.is_downloaded("medium"))  # "known missing" marker
+
+    def test_every_model_has_repo_and_size(self):
+        for size in al.MODELS:
+            self.assertIn(size, al.MODEL_REPOS)
+            self.assertIn(size, al.MODEL_DOWNLOAD_SIZE)
+
+
 class ImportTest(unittest.TestCase):
     @unittest.skipUnless(al.is_available(), "faster-whisper não instalado")
     def test_whisper_imports_even_if_pyav_is_blocked(self):

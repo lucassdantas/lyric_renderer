@@ -229,6 +229,17 @@ class AppTest(unittest.TestCase):
         self.assertEqual(str(dialog.gen_btn.cget("state")), "normal")
         dialog.destroy()
 
+    def test_auto_lyrics_shows_if_model_is_downloaded(self):
+        downloaded = {"small"}
+        with mock.patch.object(lr.auto_lyrics, "is_downloaded", side_effect=lambda m: m in downloaded):
+            dialog = self._auto_dialog()
+            self.assertIn("já baixado", dialog.status_label.cget("text"))
+            dialog.model_var.set(lr.auto_lyrics.MODELS["medium"])
+            dialog._show_model_status()
+            self.assertIn("~1,5 GB", dialog.status_label.cget("text"))
+            self.assertNotIn("já baixado", dialog.status_label.cget("text"))
+        dialog.destroy()
+
     def test_auto_lyrics_needs_audio(self):
         dialog = self._auto_dialog()
         dialog.audio_var.set("")

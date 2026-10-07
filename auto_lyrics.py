@@ -31,6 +31,11 @@ MODELS = {
     "medium": "Preciso (medium)",
 }
 DEFAULT_MODEL = "small"
+MODEL_REPOS = {
+    "small": "Systran/faster-whisper-small",
+    "medium": "Systran/faster-whisper-medium",
+}
+MODEL_DOWNLOAD_SIZE = {"small": "~0,5 GB", "medium": "~1,5 GB"}
 
 # Strophe grouping (transcribe mode)
 LINE_GAP = 0.6         # pause between words that starts a new line (s)
@@ -145,6 +150,17 @@ _model_cache = {}
 def is_available() -> bool:
     import importlib.util
     return importlib.util.find_spec("faster_whisper") is not None
+
+
+def is_downloaded(size: str) -> bool:
+    """True if the model files are already in the local Hugging Face cache."""
+    if size in _model_cache:
+        return True
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        return isinstance(try_to_load_from_cache(MODEL_REPOS[size], "model.bin"), str)
+    except Exception:
+        return False
 
 
 def _import_whisper_model():
