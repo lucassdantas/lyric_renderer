@@ -1,5 +1,7 @@
 """Pure logic: time parsing/formatting, colors, paste-block parser, project files."""
 import json
+import os
+import tempfile
 import unittest
 
 import lyric_renderer as lr
@@ -155,6 +157,90 @@ class MergeWithNextTest(unittest.TestCase):
         self.assertEqual(len(lr.merge_with_next(self.s, 3)), 3)
         self.assertEqual(len(lr.merge_with_next(self.s, 99)), 3)
         self.assertEqual(lr.merge_with_next([], 1), [])
+
+
+class TitleFromFilenameTest(unittest.TestCase):
+    def test_common_names(self):
+        cases = {
+            "Onde_Eu_Fui.mp3": "Onde Eu Fui",
+            "onde_eu_fui_2.mp3": "Onde Eu Fui",
+            "03_onde_eu_fui (1).mp3": "Onde Eu Fui",
+            "Onde Eu Fui [2].wav": "Onde Eu Fui",
+            "onde eu fui.mp3": "Onde Eu Fui",
+            "ONDE EU FUI.mp3": "Onde Eu Fui",
+            "onde-eu-fui.mp3": "Onde Eu Fui",
+            "01 - Onde Eu Fui.mp3": "Onde Eu Fui",
+            "1. onde eu fui.mp3": "Onde Eu Fui",
+            r"C:\Musicas\onde_eu_fui.mp3": "Onde Eu Fui",
+        }
+        for name, title in cases.items():
+            self.assertEqual(lr.title_from_filename(name), title, name)
+
+    def test_numbers_and_hyphens_that_belong_to_the_name(self):
+        self.assertEqual(lr.title_from_filename("22 de Outubro.mp3"), "22 De Outubro")
+        self.assertEqual(lr.title_from_filename("Guarda-chuva Azul.mp3"), "Guarda-chuva Azul")
+        self.assertEqual(lr.title_from_filename("1.mp3"), "1")
+
+
+class ConfigTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "sub", "config.json")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_round_trip_and_missing_file(self):
+        self.assertEqual(lr.load_config(self.path), {})
+        lr.save_config({"bg_image": "C:/fundo.png", "lyric_size": 50}, self.path)
+        self.assertEqual(lr.load_config(self.path), {"bg_image": "C:/fundo.png", "lyric_size": 50})
+
+    def test_corrupt_file_is_ignored(self):
+        os.makedirs(os.path.dirname(self.path))
+        with open(self.path, "w") as f:
+            f.write("{nope")
+        self.assertEqual(lr.load_config(self.path), {})
+
+    def test_env_override(self):
+        old = os.environ.get("LYRIC_RENDERER_CONFIG")
+        os.environ["LYRIC_RENDERER_CONFIG"] = self.path
+        try:
+            self.assertEqual(lr.config_path(), self.path)
+        finally:
+            if old is None:
+                del os.environ["LYRIC_RENDERER_CONFIG"]
+            else:
+                os.environ["LYRIC_RENDERER_CONFIG"] = old
+
+    def test_apply_style_skips_wrong_types(self):
+        p = lr.Project()
+        lr.apply_style(p, {"lyric_size": 40, "fade_duration": 1, "fps": "30",
+                           "text_color": "#ff0000", "title": "não é estilo"})
+        self.assertEqual((p.lyric_size, p.fade_duration, p.fps, p.text_color, p.title),
+                         (40, 1.0, 25, "#ff0000", "Título da Música"))
+
+    def test_style_of_round_trip(self):
+        p = lr.Project(lyric_size=33, transparent_bg=False)
+        q = lr.Project()
+        lr.apply_style(q, lr.style_of(p))
+        self.assertEqual(lr.style_of(q), lr.style_of(p))
+
+
+class OutputPathTest(unittest.TestCase):
+    def test_final_output_path(self):
+        self.assertEqual(lr.final_output_path("C:/v/a.mp4", False), "C:/v/a.mp4")
+        self.assertEqual(lr.final_output_path("C:/v/a.mp4", True), "C:/v/a.webm")
+        self.assertEqual(lr.final_output_path("C:/v/a.webm", True), "C:/v/a.webm")
+
+    def test_project_is_transparent(self):
+        self.assertTrue(lr.project_is_transparent(lr.Project(transparent_bg=True)))
+        self.assertFalse(lr.project_is_transparent(lr.Project(transparent_bg=False)))
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            img = f.name
+        try:
+            self.assertFalse(lr.project_is_transparent(lr.Project(transparent_bg=True, bg_image=img)))
+        finally:
+            os.remove(img)
 
 
 class ProjectSerializationTest(unittest.TestCase):

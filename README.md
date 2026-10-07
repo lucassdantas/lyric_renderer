@@ -1,58 +1,42 @@
 # LyricRenderer 🎵
 
-Gerador de vídeos de letras de música — rápido, centralizado, com fade pro transparente.
+Gera vídeos de letra de música: fundo + título + cada estrofe no centro, com fade. A legenda pode ser gerada automaticamente a partir do áudio (Whisper, roda no seu PC).
 
-## Requisitos
+## Instalar
 
 - Python 3.9+
-- FFmpeg instalado no sistema
-- Pillow (`pip install Pillow`)
+- [FFmpeg](https://www.gyan.dev/ffmpeg/builds/) no PATH (é ele que monta o vídeo)
 
-## Como instalar
+As bibliotecas do Python (Pillow e faster-whisper) o próprio app oferece pra instalar quando abre. Se preferir instalar na mão:
 
 ```bash
-# Instalar dependências
 pip install -r requirements.txt
-
-# OU use o launcher que instala automaticamente:
-python run.py
 ```
 
-**FFmpeg:**
-- Ubuntu/Debian: `sudo apt install ffmpeg`
-- macOS: `brew install ffmpeg`
-- Windows: https://ffmpeg.org/download.html
+## Abrir
+
+- **Duplo clique** no atalho **LyricRenderer** da Área de Trabalho (abre sem terminal)
+- ou pelo terminal: `python lyric_renderer.py`
+
+Pra criar o atalho de novo (ex.: mudou a pasta de lugar): `python tools/create_shortcut.py`
 
 ## Como usar
 
-```bash
-python lyric_renderer.py
-```
+1. **Áudio** → `Escolher…`. O **título** é preenchido sozinho a partir do nome do arquivo (`03_onde_eu_fui (1).mp3` → `Onde Eu Fui`); dá pra editar.
+2. **Fundo** → `Escolher…`. A imagem fica salva pras próximas músicas.
+3. **🎤 Gerar automática** → cole a letra (opcional, mas deixa bem mais preciso) → `Gerar`.
+   - Estrofes separadas por linha em branco viram estrofes separadas.
+   - O que estiver entre `[ ]` (ex.: `[refrão]`) é ignorado, igual ao Suno. Dá pra desligar.
+4. **Confira**: clique numa estrofe pra ver na **prévia** como fica. `✎` edita (setinhas ±1s), `↓ Juntar` junta com a de baixo, `✕` apaga.
+5. **▶ Renderizar vídeo** → escolha a pasta e o nome. Se o arquivo já existir, ele pergunta antes de substituir.
 
-### Fluxo de trabalho
+Pra próxima música: troque o áudio (o título acompanha), gere a legenda, confira e renderize.
 
-1. **Configurações** (painel esquerdo):
-   - Título da música, fonte, tamanho
-   - Cor do texto e do fundo
-   - Arquivo de áudio (opcional)
-   - FPS e resolução
+**⚙ Configurações** (fonte, tamanhos, cores, fundo sem imagem, fade, FPS, resolução) ficam numa janela separada e são lembradas entre uma vez e outra.
 
-2. **Estrofes** (painel direito):
-   - Clique `+ Nova Estrofe` para adicionar manualmente
-   - OU clique `📋 Colar Bloco` para importar várias de uma vez
+Atalhos: `Ctrl+R` renderizar · `Ctrl+S` salvar projeto · `Ctrl+O` abrir projeto · `Ctrl+N` novo projeto.
 
-   - OU clique `🎤 Gerar Legenda` para gerar tudo automaticamente a partir do áudio
-
-### Gerar Legenda (automático)
-
-1. Clique `🎤 Gerar Legenda` e escolha o áudio da música (se já estiver no painel, vem preenchido)
-2. **Opcional, mas recomendado:** cole a letra (estrofes separadas por linha em branco). O texto fica exatamente igual e só os tempos são detectados. Sem letra, a IA escreve sozinha e pode errar palavras.
-3. Clique `Gerar`. A primeira vez baixa o modelo (~0,5 GB no "Rápido"); depois, uma música de 3 min leva por volta de 1 min no processador.
-4. As estrofes aparecem na lista: revise tempos e texto e renderize.
-
-Precisa do `faster-whisper` (`pip install faster-whisper`, o `run.py` instala sozinho). Roda 100% no seu PC, sem internet depois do download do modelo.
-
-### Formato do Colar Bloco
+### Colar com tempos (📋 Colar)
 
 ```
 00:05 - 00:15
@@ -61,50 +45,18 @@ mais letra da música
 
 00:20 - 00:30
 Próxima estrofe
-mais letra
-
-01:10 - 01:25
-Mais uma estrofe
 ```
 
-- Separe estrofes por **linha em branco**
-- Formatos de tempo aceitos: `00:05`, `01:30`, `00:05.50`, `00:05,50`, `1:30.00`, `1:02:03`
-- Estrofes com erro (sem tempo, sem letra, fim antes do início) são listadas e puladas
-
-### Renderizar
-
-- **Ctrl+R** ou botão `▶ Renderizar`
-- Escolha `.mp4` para vídeo normal com fundo
-- Escolha `.webm` para vídeo com **transparência** (para sobrepor no editor)
-
-### Salvar/abrir projeto
-
-- **Ctrl+S** salva o projeto como `.lyr` (JSON)
-- Pode reabrir e editar depois
-
-## Vantagens sobre o método anterior
-
-| Antes (Kdenlive manual) | LyricRenderer |
-|------------------------|---------------|
-| Colar cada estrofe individualmente | Colar tudo de uma vez |
-| Posicionar cada texto | Centralização automática |
-| Efeito fade em cada uma | Fade automático em todas |
-| Trabalho repetitivo | Um projeto, render em segundos |
+Formatos de tempo: `00:05`, `01:30`, `00:05.50`, `00:05,50`, `1:02:03`.
 
 ## Formato de saída
 
-- **MP4** (H.264 + AAC): Fundo sólido ou imagem, pronto para usar
-- **WebM** (VP9 + Opus): Transparência total, ideal para sobrepor no Kdenlive como overlay
-- Com áudio, o vídeo dura a música inteira (ou até a última estrofe + 1,5s, o que for maior)
+- **Com imagem de fundo ou cor sólida** → `.mp4` (H.264 + AAC)
+- **Fundo transparente** (sem imagem, opção nas Configurações) → `.webm` (VP9 com alpha + Opus), pra sobrepor no editor
+- Com áudio, o vídeo dura a música inteira
 
 ## Desenvolvimento
 
 - Arquitetura: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- Testes (sem dependências extras): `python -m unittest discover -s tests -t .`
-
-## Dicas
-
-- Use `.webm` se quiser continuar usando o Kdenlive só para combinar com o vídeo
-- O título aparece fixo durante toda a música com fade no início/fim
-- Cada estrofe aparece no **centro exato** da tela
-- O fade é pro **transparente** (não pro preto)
+- Testes: `python -m unittest discover -s tests -t .`
+- Ícone: `python tools/make_icon.py` gera `assets/icon.png` e `assets/icon.ico`

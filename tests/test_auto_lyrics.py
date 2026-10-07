@@ -39,9 +39,38 @@ class NormalizeTest(unittest.TestCase):
         self.assertEqual(al.normalize_word("..."), "")
 
     def test_split_lyrics(self):
-        lyrics = "[Verso 1]\nLinha a\n  Linha b\n\n(Refrão)\nLinha c\n\n\n[Final]\n"
+        lyrics = "[Verso 1]\nLinha a\n  Linha b\n\n[Refrão]\nLinha c\n\n\n[Final]\n"
         self.assertEqual(al.split_lyrics(lyrics), [["Linha a", "Linha b"], ["Linha c"]])
         self.assertEqual(al.split_lyrics("   "), [])
+
+    def test_parentheses_are_sung_so_they_stay(self):
+        # Suno sings (backing vocals); only [ ] is ignored
+        self.assertEqual(al.split_lyrics("Linha a (uh uh)\n(oh oh)"),
+                         [["Linha a (uh uh)", "(oh oh)"]])
+
+    def test_inline_tags_are_removed(self):
+        self.assertEqual(al.strip_tags("Eu fui [ad-lib] embora  [x]"), "Eu fui embora")
+        self.assertEqual(al.split_lyrics("Linha a [sussurrado]\nLinha b"),
+                         [["Linha a", "Linha b"]])
+
+    def test_tag_line_starts_new_strophe_even_without_blank_line(self):
+        lyrics = "[estrofe]\na\nb\n[pré-refrão]\nc\nd"
+        self.assertEqual(al.split_lyrics(lyrics), [["a", "b"], ["c", "d"]])
+
+    def test_keep_tags_when_option_is_off(self):
+        lyrics = "[estrofe]\na\nb\n\n[refrão]\nc"
+        self.assertEqual(al.split_lyrics(lyrics, ignore_tags=False),
+                         [["[estrofe]", "a", "b"], ["[refrão]", "c"]])
+
+    def test_users_song(self):
+        lyrics = ("[estrofe]\nAinda tenho a foto daquele verão\nGuardada entre livros que eu nunca abri\n"
+                  "E às vezes encontro seu olhar na lembrança\nComo se você ainda estivesse aqui\n\n"
+                  "[pré-refrão]\nEu tento seguir, mas não sei esconder\n"
+                  "Que uma parte de mim ainda chama você\n\n"
+                  "[refrão final]\nO que era nosso ainda vive em mim\nE vai ser bonito lembrar até o fim")
+        parts = al.split_lyrics(lyrics)
+        self.assertEqual([len(p) for p in parts], [4, 2, 2])
+        self.assertFalse(any("[" in line for p in parts for line in p))
 
 
 class GroupLinesTest(unittest.TestCase):
@@ -110,6 +139,15 @@ class AlignLyricsTest(unittest.TestCase):
         self.assertEqual(len(res), 3)
         self.assertGreater(res[1].start, res[0].end)
         self.assertLess(res[1].end, res[2].start)
+
+    def test_kept_tags_dont_disturb_timing(self):
+        words = (sung("O sol nasceu na beira do mar e a cidade começou a acordar", 3.0)
+                 + sung("Eu caminhei sozinho pela praia", 14.0)
+                 + sung("Mas amanhã é outro dia", 25.0))
+        res = al.align_lyrics(self.LYRICS, words, audio_end=40, ignore_tags=False)
+        self.assertTrue(res[0].text.startswith("[Verso]\n"))
+        self.assertAlmostEqual(res[0].start, 3.0 - al.PAD_BEFORE)
+        self.assertAlmostEqual(res[2].start, 25.0 - al.PAD_BEFORE)
 
     def test_empty(self):
         self.assertEqual(al.align_lyrics("", sung("oi", 1)), [])

@@ -3,9 +3,10 @@
 LyricRenderer — Gerador de vídeos de letras de música
 Renderiza estrofes com fade in/out transparente sobre fundo preto/personalizado.
 """
+from __future__ import annotations  # PIL types in hints even when Pillow is missing
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, font as tkfont
+from tkinter import ttk, filedialog, messagebox
 import json
 import os
 import sys
@@ -13,20 +14,23 @@ import subprocess
 import threading
 import queue
 import re
-import struct
-import zlib
+import functools
+import traceback
 from pathlib import Path
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from typing import List, Optional
 import colorsys
 
 import auto_lyrics
+import deps
 
 try:
-    from PIL import Image, ImageDraw, ImageFont, ImageFilter
+    from PIL import Image, ImageDraw, ImageFont, ImageTk
     HAS_PIL = True
-except ImportError:
+    PIL_ERROR = ""
+except ImportError as _e:  # missing, or its DLLs were blocked
     HAS_PIL = False
+    PIL_ERROR = str(_e)
 
 
 # ─────────────────────────────────────────────
@@ -146,6 +150,85 @@ def safe_filename(name: str) -> str:
     return cleaned or "video"
 
 
+def title_from_filename(path: str) -> str:
+    """
+    Song title from the audio file name: underscores/hyphens become spaces,
+    track numbers and copy markers like "(1)" are dropped, and every word gets
+    a capital first letter. "03_onde_eu_fui (1).mp3" → "Onde Eu Fui".
+    """
+    name = os.path.splitext(os.path.basename(path))[0]
+    name = name.replace("_", " ")
+    if " " not in name.strip():
+        name = name.replace("-", " ")  # slug style: onde-eu-fui
+    name = re.sub(r"\s*[\(\[]\s*\d+\s*[\)\]]\s*$", "", name)  # "(1)", "[2]"
+    words = name.split()
+    # leading track number: zero-padded ("03") or followed by - . ) — but
+    # keep numbers that are part of the name ("22 de Outubro")
+    while len(words) > 1 and (re.fullmatch(r"0\d*[.)-]?|\d+[.)-]", words[0])
+                              or (words[0].isdigit() and words[1] == "-")):
+        words.pop(0)
+    while len(words) > 1 and words[-1].isdigit():
+        words.pop()  # trailing copy number
+    words = [w for w in words if w != "-"]
+    return " ".join(w[:1].upper() + w[1:].lower() for w in words)
+
+
+# ─────────────────────────────────────────────
+#  App config (settings that rarely change, kept between sessions)
+# ─────────────────────────────────────────────
+
+STYLE_FIELDS = ("title_font", "title_size", "lyric_font", "lyric_size", "line_spacing",
+                "fade_duration", "text_color", "title_color", "transparent_bg", "bg_color",
+                "video_width", "video_height", "fps")
+
+
+def config_path() -> str:
+    """Where the app config lives (LYRIC_RENDERER_CONFIG overrides it)."""
+    override = os.environ.get("LYRIC_RENDERER_CONFIG")
+    if override:
+        return override
+    base = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "LyricRenderer", "config.json")
+
+
+def load_config(path: Optional[str] = None) -> dict:
+    try:
+        with open(path or config_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg: dict, path: Optional[str] = None):
+    path = path or config_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        pass  # losing preferences isn't worth interrupting the user
+
+
+def style_of(project: "Project") -> dict:
+    return {f: getattr(project, f) for f in STYLE_FIELDS}
+
+
+def apply_style(project: "Project", cfg: dict):
+    """Copy saved style settings into the project, skipping wrong types."""
+    defaults = Project()
+    for f in STYLE_FIELDS:
+        if f not in cfg:
+            continue
+        value, default = cfg[f], getattr(defaults, f)
+        if isinstance(default, float) and isinstance(value, int) and not isinstance(value, bool):
+            value = float(value)
+        if type(value) is type(default):
+            setattr(project, f, value)
+
+
 _TIME_RE = r"\d{1,2}(?::\d{2}){1,2}(?:[.,]\d+)?"
 _BLOCK_HEADER = re.compile(rf"^({_TIME_RE})\s*[-–—]\s*({_TIME_RE})\s*(.*)$")
 
@@ -256,6 +339,29 @@ def find_font(font_name: str, size: int):
         except Exception:
             pass
 
+    path = _search_font_file(font_name)
+    if path:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            pass
+
+    # Try direct path/name (works if user typed a full path)
+    try:
+        return ImageFont.truetype(font_name, size)
+    except Exception:
+        pass
+
+    # Absolute fallback — PIL default (small but works)
+    try:
+        return ImageFont.load_default(size=size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+@functools.lru_cache(maxsize=32)
+def _search_font_file(font_name: str) -> Optional[str]:
+    """Walk the system font folders once per name (the preview asks a lot)."""
     search_dirs = [
         "C:/Windows/Fonts",
         "/usr/share/fonts",
@@ -276,22 +382,19 @@ def find_font(font_name: str, size: int):
                     continue
                 fname_lower = os.path.splitext(f)[0].lower().replace(" ", "").replace("-", "").replace("_", "")
                 if name_lower in fname_lower or fname_lower in name_lower:
+                    path = os.path.join(root, f)
                     try:
-                        return ImageFont.truetype(os.path.join(root, f), size)
+                        ImageFont.truetype(path, 12)  # skip broken files
+                        return path
                     except Exception:
                         pass
+    return None
 
-    # Try direct path/name (works if user typed a full path)
-    try:
-        return ImageFont.truetype(font_name, size)
-    except Exception:
-        pass
 
-    # Absolute fallback — PIL default (small but works)
-    try:
-        return ImageFont.load_default(size=size)
-    except Exception:
-        return ImageFont.load_default()
+@functools.lru_cache(maxsize=4)
+def _load_background(path: str, mtime: float, w: int, h: int):
+    """Background image resized to the video size (cached for the preview)."""
+    return Image.open(path).convert("RGB").resize((w, h), Image.LANCZOS)
 
 
 def _draw_text_centered(draw, text: str, font, color, canvas_w: int, y: int):
@@ -324,6 +427,18 @@ def probe_duration(path: str) -> float:
         return 0.0
 
 
+def final_output_path(output_path: str, transparent: bool) -> str:
+    """The file actually written: transparent video is always .webm."""
+    if transparent and Path(output_path).suffix.lower() != ".webm":
+        return Path(output_path).with_suffix(".webm").as_posix()
+    return output_path
+
+
+def project_is_transparent(project: Project) -> bool:
+    """Same rule as the renderer: a background image disables transparency."""
+    return project.transparent_bg and not (project.bg_image and os.path.isfile(project.bg_image))
+
+
 def build_ffmpeg_cmd(output_path: str, width: int, height: int, fps: int,
                      transparent: bool, audio_path: str = ""):
     """
@@ -333,11 +448,8 @@ def build_ffmpeg_cmd(output_path: str, width: int, height: int, fps: int,
     - .webm       → VP9 + Opus (WebM does not accept H.264/AAC)
     - otherwise   → H.264 + AAC
     """
-    ext = Path(output_path).suffix.lower()
-    if transparent and ext != ".webm":
-        output_path = Path(output_path).with_suffix(".webm").as_posix()
-        ext = ".webm"
-    webm = ext == ".webm"
+    output_path = final_output_path(output_path, transparent)
+    webm = Path(output_path).suffix.lower() == ".webm"
 
     cmd = [
         "ffmpeg", "-y",
@@ -410,9 +522,9 @@ class FrameRenderer:
         self._bg_img = None
         if project.bg_image and os.path.isfile(project.bg_image):
             try:
-                bg = Image.open(project.bg_image).convert("RGB")
-                bg = bg.resize((self.w, self.h), Image.LANCZOS)
-                self._bg_img = bg
+                self._bg_img = _load_background(project.bg_image,
+                                                os.path.getmtime(project.bg_image),
+                                                self.w, self.h)
             except Exception:
                 pass
 
@@ -619,18 +731,20 @@ class FrameRenderer:
 # ─────────────────────────────────────────────
 
 DARK = {
-    "bg": "#1a1a2e",
-    "surface": "#16213e",
-    "surface2": "#0f3460",
+    "bg": "#101017",
+    "surface": "#181822",
+    "surface2": "#262634",
     "accent": "#e94560",
-    "accent2": "#533483",
-    "text": "#eaeaea",
-    "text_dim": "#8888aa",
-    "border": "#2a2a4a",
-    "success": "#4caf50",
+    "accent2": "#6f4fc8",
+    "text": "#ececf3",
+    "text_dim": "#8b8ba6",
+    "border": "#2c2c3d",
+    "success": "#3fb67a",
     "warn": "#ff9800",
-    "entry_bg": "#0d1b2a",
+    "entry_bg": "#0c0c12",
+    "selected": "#e94560",
 }
+UI_FONT = "Segoe UI"
 
 
 def bind_wheel_scroll(canvas: tk.Canvas):
@@ -662,37 +776,93 @@ def bind_wheel_scroll(canvas: tk.Canvas):
 
 
 class StyledButton(tk.Button):
+    STYLES = {
+        "primary": (DARK["accent"], "#fff"),
+        "secondary": (DARK["surface2"], DARK["text"]),
+        "ghost": (DARK["surface"], DARK["text"]),
+        "danger": ("#5a1f2c", "#ff9a9a"),
+        "success": ("#1d5a3c", "#b5f0cf"),
+    }
+
     def __init__(self, parent, text, command=None, style="primary", **kwargs):
-        colors = {
-            "primary": (DARK["accent"], "#fff"),
-            "secondary": (DARK["surface2"], DARK["text"]),
-            "danger": ("#7a1e2e", "#ff8a8a"),
-            "success": ("#1b5e20", "#a5d6a7"),
-        }
-        bg, fg = colors.get(style, colors["primary"])
+        bg, fg = self.STYLES.get(style, self.STYLES["primary"])
         # Use caller-supplied padx/pady if provided, else defaults
         kwargs.setdefault("padx", 14)
-        kwargs.setdefault("pady", 8)
-        kwargs.setdefault("font", ("Segoe UI", 10, "bold"))
+        kwargs.setdefault("pady", 7)
+        kwargs.setdefault("font", (UI_FONT, 10, "bold"))
         super().__init__(
             parent, text=text, command=command,
-            bg=bg, fg=fg, activebackground=DARK["accent2"],
-            activeforeground="#fff", relief="flat",
-            bd=0, cursor="hand2",
+            bg=bg, fg=fg, activebackground=self._lighten(bg),
+            activeforeground=fg, relief="flat",
+            bd=0, cursor="hand2", disabledforeground=DARK["text_dim"],
+            highlightthickness=0,
             **kwargs
         )
         self.bind("<Enter>", lambda e: self.config(bg=self._lighten(bg)))
         self.bind("<Leave>", lambda e: self.config(bg=bg))
 
-    def _lighten(self, hex_color):
+    @staticmethod
+    def _lighten(hex_color):
         try:
             r, g, b = hex_to_rgb(hex_color)
             h, s, v = colorsys.rgb_to_hsv(r/255, g/255, b/255)
-            v = min(1.0, v + 0.15)
+            v = min(1.0, v + 0.12)
             r2, g2, b2 = colorsys.hsv_to_rgb(h, s, v)
             return f"#{int(r2*255):02x}{int(g2*255):02x}{int(b2*255):02x}"
         except Exception:
             return hex_color
+
+
+def styled_entry(parent, var, font_size=10, **kw):
+    """Flat dark entry with an accent focus ring."""
+    return tk.Entry(parent, textvariable=var, bg=DARK["entry_bg"], fg=DARK["text"],
+                    insertbackground=DARK["text"], relief="flat", bd=6,
+                    font=(UI_FONT, font_size), highlightthickness=1,
+                    highlightbackground=DARK["border"], highlightcolor=DARK["accent"], **kw)
+
+
+def section_title(parent, text, bg):
+    return tk.Label(parent, text=text.upper(), bg=bg, fg=DARK["text_dim"],
+                    font=(UI_FONT, 8, "bold"))
+
+
+def open_folder(folder: str):
+    if sys.platform == "win32":
+        os.startfile(folder)
+    elif sys.platform == "darwin":
+        subprocess.run(["open", folder])
+    else:
+        subprocess.run(["xdg-open", folder])
+
+
+class WorkerMixin:
+    """
+    Run a function in a background thread; it reports back by queueing
+    callbacks that are executed on the Tk thread (Tk is not thread-safe).
+    """
+
+    def start_worker(self, target):
+        self._events = queue.Queue()
+        self._working = True
+
+        def poll():
+            try:
+                while True:
+                    self._events.get_nowait()()
+            except queue.Empty:
+                pass
+            if self._working:
+                self.after(100, poll)
+
+        self.after(100, poll)
+        threading.Thread(target=target, daemon=True).start()
+
+    def post(self, fn):
+        """Thread-safe: run fn on the Tk thread."""
+        self._events.put(fn)
+
+    def stop_worker(self):
+        self._working = False
 
 
 class TimeEntry(tk.Frame):
@@ -946,6 +1116,9 @@ class StropheEditor(tk.Toplevel):
 
 
 class SettingsPanel(tk.Frame):
+    """Look-and-video settings (fonts, colors, background color, fps…).
+    Nothing is written to the project until _apply()."""
+
     def __init__(self, parent, project: Project, on_change=None):
         super().__init__(parent, bg=DARK["surface"])
         self.project = project
@@ -953,61 +1126,48 @@ class SettingsPanel(tk.Frame):
         self._build()
 
     def _section(self, text):
-        parent = getattr(self, "_inner", self)
-        f = tk.Frame(parent, bg=DARK["surface"])
-        f.pack(fill="x", padx=12, pady=(12, 4))
-        tk.Label(f, text=text.upper(), bg=DARK["surface"],
-                 fg=DARK["accent"], font=("Segoe UI", 8, "bold")).pack(anchor="w")
-        sep = tk.Frame(f, bg=DARK["border"], height=1)
-        sep.pack(fill="x", pady=(2, 0))
+        f = tk.Frame(self._inner, bg=DARK["surface"])
+        f.pack(fill="x", padx=16, pady=(16, 6))
+        section_title(f, text, DARK["surface"]).pack(anchor="w")
+        tk.Frame(f, bg=DARK["border"], height=1).pack(fill="x", pady=(4, 0))
         return f
 
-    def _row(self, parent, label, widget_factory):
+    def _row(self, parent, label, widget_factory, stretch=True):
         row = tk.Frame(parent, bg=DARK["surface"])
-        row.pack(fill="x", padx=12, pady=3)
+        row.pack(fill="x", padx=16, pady=4)
         tk.Label(row, text=label, bg=DARK["surface"], fg=DARK["text_dim"],
-                 font=("Segoe UI", 9), width=18, anchor="w").pack(side="left")
+                 font=(UI_FONT, 9), width=16, anchor="w").pack(side="left")
         w = widget_factory(row)
-        w.pack(side="left", fill="x", expand=True)
+        w.pack(side="left", fill="x" if stretch else None, expand=stretch)
         return w
 
-    def _entry(self, parent, var, width=None):
-        kw = {"textvariable": var, "bg": DARK["entry_bg"], "fg": DARK["text"],
-              "insertbackground": DARK["text"], "relief": "flat",
-              "font": ("Segoe UI", 10), "bd": 4}
-        if width:
-            kw["width"] = width
-        e = tk.Entry(parent, **kw)
-        e.bind("<FocusOut>", lambda _: self._notify())
-        return e
-
     def _spin(self, parent, var, from_, to, width=7, increment=1):
-        s = tk.Spinbox(parent, textvariable=var, from_=from_, to=to, width=width,
-                       increment=increment,
-                       bg=DARK["entry_bg"], fg=DARK["text"], buttonbackground=DARK["surface2"],
-                       insertbackground=DARK["text"], relief="flat", font=("Segoe UI", 10),
-                       command=self._notify)
-        s.bind("<FocusOut>", lambda _: self._notify())
-        return s
+        return tk.Spinbox(parent, textvariable=var, from_=from_, to=to, width=width,
+                          increment=increment,
+                          bg=DARK["entry_bg"], fg=DARK["text"], buttonbackground=DARK["surface2"],
+                          insertbackground=DARK["text"], relief="flat", font=(UI_FONT, 10),
+                          highlightthickness=1, highlightbackground=DARK["border"],
+                          highlightcolor=DARK["accent"])
 
     def _color_btn(self, parent, var):
         from tkinter import colorchooser
-        btn = tk.Button(parent, bg=var.get(), width=4, relief="flat", bd=0,
-                        cursor="hand2")
+        btn = tk.Button(parent, bg=var.get(), width=6, relief="flat", bd=0,
+                        cursor="hand2", highlightthickness=1,
+                        highlightbackground=DARK["border"])
         # Keep the swatch in sync when the var changes (e.g. project opened)
-        var.trace_add("write", lambda *_: btn.config(bg=var.get()))
+        var.trace_add("write", lambda *_: btn.config(bg=var.get(), activebackground=var.get()))
+
         def pick():
             c = colorchooser.askcolor(color=var.get(), parent=self)[1]
             if c:
                 var.set(c)
-                self._notify()
         btn.config(command=pick)
         return btn
 
     def _build(self):
         p = self.project
 
-        # Wrap everything in a scrollable canvas so the panel never clips on small screens
+        # Scrollable, so it never clips on small screens
         outer = tk.Canvas(self, bg=DARK["surface"], highlightthickness=0)
         vsb = ttk.Scrollbar(self, orient="vertical", command=outer.yview)
         outer.configure(yscrollcommand=vsb.set)
@@ -1018,135 +1178,72 @@ class SettingsPanel(tk.Frame):
         inner.bind("<Configure>", lambda e: outer.configure(scrollregion=outer.bbox("all")))
         outer.bind("<Configure>", lambda e: outer.itemconfig(win_id, width=e.width))
         bind_wheel_scroll(outer)
-        self._inner = inner  # all sub-widgets go here
-
-        # ── Song settings ──────────────────────────────────
-        self._section("🎵 Música")
-
-        self.title_var = tk.StringVar(value=p.title)
-        self._row(inner, "Título", lambda f: self._entry(f, self.title_var))
-
-        # Audio
-        af = tk.Frame(inner, bg=DARK["surface"])
-        af.pack(fill="x", padx=12, pady=3)
-        tk.Label(af, text="Áudio (opcional)", bg=DARK["surface"], fg=DARK["text_dim"],
-                 font=("Segoe UI", 9), width=18, anchor="w").pack(side="left")
-        self.audio_var = tk.StringVar(value=p.audio_file)
-        e = tk.Entry(af, textvariable=self.audio_var, bg=DARK["entry_bg"], fg=DARK["text"],
-                     insertbackground=DARK["text"], relief="flat", font=("Segoe UI", 9), bd=4)
-        e.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        StyledButton(af, "...", command=self._pick_audio, style="secondary",
-                     padx=8, pady=4).pack(side="left")
+        self._inner = inner
 
         # ── Typography ─────────────────────────────────────
-        self._section("✏️ Tipografia")
-
+        self._section("Texto")
         self.title_font_var = tk.StringVar(value=p.title_font)
-        self._row(inner, "Fonte do título", lambda f: self._entry(f, self.title_font_var))
-
+        self._row(inner, "Fonte do título", lambda f: styled_entry(f, self.title_font_var))
         self.title_size_var = tk.IntVar(value=p.title_size)
-        self._row(inner, "Tamanho título", lambda f: self._spin(f, self.title_size_var, 20, 200))
-
+        self._row(inner, "Tamanho do título", lambda f: self._spin(f, self.title_size_var, 20, 200))
         self.lyric_font_var = tk.StringVar(value=p.lyric_font)
-        self._row(inner, "Fonte da letra", lambda f: self._entry(f, self.lyric_font_var))
-
+        self._row(inner, "Fonte da letra", lambda f: styled_entry(f, self.lyric_font_var))
         self.lyric_size_var = tk.IntVar(value=p.lyric_size)
-        self._row(inner, "Tamanho letra", lambda f: self._spin(f, self.lyric_size_var, 16, 160))
-
+        self._row(inner, "Tamanho da letra", lambda f: self._spin(f, self.lyric_size_var, 16, 160))
         self.line_spacing_var = tk.IntVar(value=p.line_spacing)
-        self._row(inner, "Espaç. linhas", lambda f: self._spin(f, self.line_spacing_var, 0, 80))
+        self._row(inner, "Espaço entre linhas", lambda f: self._spin(f, self.line_spacing_var, 0, 80))
 
-        # ── Cores ──────────────────────────────────────────
-        self._section("🎨 Cores")
-
+        # ── Colors ─────────────────────────────────────────
+        self._section("Cores")
         self.title_color_var = tk.StringVar(value=p.title_color)
-        self._row(inner, "Cor do título", lambda f: self._color_btn(f, self.title_color_var))
-
+        self._row(inner, "Cor do título", lambda f: self._color_btn(f, self.title_color_var), stretch=False)
         self.text_color_var = tk.StringVar(value=p.text_color)
-        self._row(inner, "Cor da letra",  lambda f: self._color_btn(f, self.text_color_var))
+        self._row(inner, "Cor da letra", lambda f: self._color_btn(f, self.text_color_var), stretch=False)
 
-        # ── Fundo ──────────────────────────────────────────
-        self._section("🖼️ Fundo")
-
-        # Transparent toggle
-        tr_row = tk.Frame(inner, bg=DARK["surface"])
-        tr_row.pack(fill="x", padx=12, pady=3)
-        tk.Label(tr_row, text="Fundo transparente", bg=DARK["surface"], fg=DARK["text_dim"],
-                 font=("Segoe UI", 9), width=18, anchor="w").pack(side="left")
+        # ── Background (when there's no image) ─────────────
+        self._section("Fundo sem imagem")
+        self._transparent_row = tk.Frame(inner, bg=DARK["surface"])
+        self._transparent_row.pack(fill="x", padx=16, pady=4)
         self.transparent_var = tk.BooleanVar(value=p.transparent_bg)
-        chk = tk.Checkbutton(tr_row, variable=self.transparent_var,
-                              bg=DARK["surface"], fg=DARK["text"],
-                              activebackground=DARK["surface"], selectcolor=DARK["entry_bg"],
-                              command=self._on_transparent_toggle)
-        chk.pack(side="left")
-        tk.Label(tr_row, text="(WebM com alpha — para overlay)", bg=DARK["surface"],
-                 fg=DARK["text_dim"], font=("Segoe UI", 8)).pack(side="left", padx=(6,0))
+        tk.Checkbutton(self._transparent_row, text="Fundo transparente (.webm, pra sobrepor no editor)",
+                       variable=self.transparent_var, command=self._on_transparent_toggle,
+                       bg=DARK["surface"], fg=DARK["text"], activebackground=DARK["surface"],
+                       activeforeground=DARK["text"], selectcolor=DARK["entry_bg"],
+                       font=(UI_FONT, 9)).pack(side="left")
 
-        # Solid bg color (shown only when not transparent)
         self._bg_color_row = tk.Frame(inner, bg=DARK["surface"])
-        self._bg_color_row.pack(fill="x", padx=12, pady=3)
+        self._bg_color_row.pack(fill="x", padx=16, pady=4)
         tk.Label(self._bg_color_row, text="Cor de fundo", bg=DARK["surface"], fg=DARK["text_dim"],
-                 font=("Segoe UI", 9), width=18, anchor="w").pack(side="left")
+                 font=(UI_FONT, 9), width=16, anchor="w").pack(side="left")
         self.bg_color_var = tk.StringVar(value=p.bg_color)
         self._color_btn(self._bg_color_row, self.bg_color_var).pack(side="left")
+        tk.Label(inner, text="Quando há imagem de fundo (tela principal), ela é usada no lugar disso.",
+                 bg=DARK["surface"], fg=DARK["text_dim"], font=(UI_FONT, 8)).pack(anchor="w", padx=16)
 
-        # Background image
-        bg_row = tk.Frame(inner, bg=DARK["surface"])
-        self._bg_image_row = bg_row
-        bg_row.pack(fill="x", padx=12, pady=3)
-        tk.Label(bg_row, text="Imagem de fundo", bg=DARK["surface"], fg=DARK["text_dim"],
-                 font=("Segoe UI", 9), width=18, anchor="w").pack(side="left")
-        self.bg_image_var = tk.StringVar(value=p.bg_image)
-        ei = tk.Entry(bg_row, textvariable=self.bg_image_var, bg=DARK["entry_bg"],
-                      fg=DARK["text"], insertbackground=DARK["text"],
-                      relief="flat", font=("Segoe UI", 9), bd=4)
-        ei.pack(side="left", fill="x", expand=True, padx=(0, 6))
-        StyledButton(bg_row, "...", command=self._pick_bg_image, style="secondary",
-                     padx=8, pady=4).pack(side="left")
-        tk.Label(inner, text="Imagem substitui cor de fundo e desativa transparência.",
-                 bg=DARK["surface"], fg=DARK["text_dim"],
-                 font=("Segoe UI", 8)).pack(anchor="w", padx=12)
-
-        # ── Vídeo ──────────────────────────────────────────
-        self._section("🎬 Vídeo")
-
+        # ── Video ──────────────────────────────────────────
+        self._section("Vídeo")
         self.fade_var = tk.DoubleVar(value=p.fade_duration)
-        self._row(inner, "Fade (seg)", lambda f: self._spin(f, self.fade_var, 0.1, 5.0, 7, 0.1))
-
+        self._row(inner, "Fade (segundos)", lambda f: self._spin(f, self.fade_var, 0.1, 5.0, 7, 0.1))
         self.fps_var = tk.IntVar(value=p.fps)
         self._row(inner, "FPS", lambda f: self._spin(f, self.fps_var, 10, 60))
+        self.res_var = tk.StringVar(value=f"{p.video_width}x{p.video_height}")
+        self._row(inner, "Resolução", lambda f: ttk.Combobox(
+            f, textvariable=self.res_var, values=["1920x1080", "1280x720", "3840x2160"],
+            state="readonly", width=12, font=(UI_FONT, 10)))
 
-        res_frame = tk.Frame(inner, bg=DARK["surface"])
-        res_frame.pack(fill="x", padx=12, pady=3)
-        tk.Label(res_frame, text="Resolução", bg=DARK["surface"], fg=DARK["text_dim"],
-                 font=("Segoe UI", 9), width=18, anchor="w").pack(side="left")
-        self.res_var = tk.StringVar()
-        res_menu = ttk.Combobox(res_frame, textvariable=self.res_var,
-                                values=["1920x1080", "1280x720", "3840x2160"],
-                                state="readonly", width=12, font=("Segoe UI", 10))
-        self.res_var.set(f"{p.video_width}x{p.video_height}")
-        res_menu.pack(side="left")
-        res_menu.bind("<<ComboboxSelected>>", lambda _: self._notify())
-
+        tk.Frame(inner, bg=DARK["surface"], height=12).pack()
         self._on_transparent_toggle()  # set initial visibility
 
-        # Apply button
-        StyledButton(inner, "  Aplicar Configurações", command=self._apply,
-                     style="secondary").pack(padx=12, pady=(16, 8), fill="x")
-
     def _on_transparent_toggle(self):
-        """Show/hide bg color row based on transparency checkbox."""
+        """Show the background color only when the video isn't transparent."""
         if self.transparent_var.get():
             self._bg_color_row.pack_forget()
         else:
-            self._bg_color_row.pack(fill="x", padx=12, pady=3, before=self._bg_image_row)
+            self._bg_color_row.pack(fill="x", padx=16, pady=4, after=self._transparent_row)
 
     def load(self, project: Project):
         """Point the panel at another project and show its values."""
-        self.project = project
-        p = project
-        self.title_var.set(p.title)
-        self.audio_var.set(p.audio_file)
+        self.project = p = project
         self.title_font_var.set(p.title_font)
         self.title_size_var.set(p.title_size)
         self.lyric_font_var.set(p.lyric_font)
@@ -1156,30 +1253,10 @@ class SettingsPanel(tk.Frame):
         self.text_color_var.set(p.text_color)
         self.transparent_var.set(p.transparent_bg)
         self.bg_color_var.set(p.bg_color)
-        self.bg_image_var.set(p.bg_image)
         self.fade_var.set(p.fade_duration)
         self.fps_var.set(p.fps)
         self.res_var.set(f"{p.video_width}x{p.video_height}")
         self._on_transparent_toggle()
-
-    def _pick_audio(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("Áudio", "*.mp3 *.wav *.ogg *.aac *.m4a"), ("Todos", "*.*")]
-        )
-        if path:
-            self.audio_var.set(path)
-            self._notify()
-
-    def _pick_bg_image(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("Imagem", "*.png *.jpg *.jpeg *.bmp *.webp"), ("Todos", "*.*")]
-        )
-        if path:
-            self.bg_image_var.set(path)
-            # Having a bg image disables transparency
-            self.transparent_var.set(False)
-            self._on_transparent_toggle()
-            self._notify()
 
     def _apply(self) -> bool:
         """Copy the form into the project. Returns False if a field is invalid."""
@@ -1198,7 +1275,6 @@ class SettingsPanel(tk.Frame):
             return False
 
         p = self.project
-        p.title        = self.title_var.get().strip() or "Título"
         p.title_font   = self.title_font_var.get().strip() or "mvboli"
         p.title_size   = title_size
         p.lyric_font   = self.lyric_font_var.get().strip() or "mvboli"
@@ -1209,13 +1285,7 @@ class SettingsPanel(tk.Frame):
         p.title_color  = self.title_color_var.get()
         p.text_color   = self.text_color_var.get()
         p.bg_color     = self.bg_color_var.get()
-        p.bg_image     = self.bg_image_var.get().strip()
         p.transparent_bg = self.transparent_var.get()
-        p.audio_file   = self.audio_var.get().strip()
-
-        # If bg image is set, disable transparency
-        if p.bg_image and os.path.isfile(p.bg_image):
-            p.transparent_bg = False
 
         res = self.res_var.get()
         if "x" in res:
@@ -1227,54 +1297,84 @@ class SettingsPanel(tk.Frame):
             self.on_change()
         return True
 
-    def _notify(self):
-        pass  # apply only on button click
+
+class SettingsDialog(tk.Toplevel):
+    """⚙ window: settings that rarely change. Saved for next time on 'Salvar'."""
+
+    def __init__(self, parent, project: Project, on_saved=None):
+        super().__init__(parent)
+        self.on_saved = on_saved
+        self.title("Configurações")
+        self.configure(bg=DARK["surface"])
+        self.geometry("520x640")
+        self.minsize(460, 400)
+        self.transient(parent)
+        self.grab_set()
+
+        bar = tk.Frame(self, bg=DARK["surface"])
+        bar.pack(side="bottom", fill="x", padx=16, pady=14)
+        StyledButton(bar, "Cancelar", command=self.destroy, style="secondary").pack(side="right")
+        StyledButton(bar, "Salvar", command=self._save).pack(side="right", padx=(0, 8))
+        tk.Label(bar, text="Fica salvo pras próximas vezes.", bg=DARK["surface"],
+                 fg=DARK["text_dim"], font=(UI_FONT, 8)).pack(side="left")
+
+        self.panel = SettingsPanel(self, project)
+        self.panel.pack(fill="both", expand=True)
+
+    def _save(self):
+        if self.panel._apply():
+            if self.on_saved:
+                self.on_saved()
+            self.destroy()
 
 
 class StropheList(tk.Frame):
-    def __init__(self, parent, project: Project, on_change=None, on_auto_lyrics=None):
+    """Right column: the strophe cards. Clicking a card selects it (preview)."""
+
+    def __init__(self, parent, project: Project, on_change=None, on_auto_lyrics=None,
+                 on_select=None):
         super().__init__(parent, bg=DARK["bg"])
         self.project = project
         self.on_change = on_change
         self.on_auto_lyrics = on_auto_lyrics
+        self.on_select = on_select
+        self.selected_id: Optional[int] = None
+        self._cards = {}
         self._build()
 
     def _build(self):
         # Header
         hdr = tk.Frame(self, bg=DARK["bg"])
-        hdr.pack(fill="x", padx=12, pady=(12, 6))
-        tk.Label(hdr, text="ESTROFES", bg=DARK["bg"], fg=DARK["accent"],
-                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        hdr.pack(fill="x", padx=(8, 12), pady=(0, 10))
+        section_title(hdr, "Legenda", DARK["bg"]).pack(side="left")
+        self.count_label = tk.Label(hdr, text="", bg=DARK["bg"], fg=DARK["text_dim"],
+                                    font=(UI_FONT, 9))
+        self.count_label.pack(side="left", padx=(8, 0))
 
-        StyledButton(hdr, "+  Nova Estrofe", command=self._add_strophe,
-                     style="primary", padx=10, pady=5).pack(side="right")
-        StyledButton(hdr, "📋 Colar Bloco", command=self._paste_block,
-                     style="secondary", padx=10, pady=5).pack(side="right", padx=(0, 6))
+        StyledButton(hdr, "+ Nova", command=self._add_strophe,
+                     style="secondary", padx=12, pady=6).pack(side="right")
+        StyledButton(hdr, "📋 Colar", command=self._paste_block,
+                     style="secondary", padx=12, pady=6).pack(side="right", padx=(0, 6))
         if self.on_auto_lyrics:
-            StyledButton(hdr, "🎤 Gerar Legenda", command=self.on_auto_lyrics,
-                         style="success", padx=10, pady=5).pack(side="right", padx=(0, 6))
+            StyledButton(hdr, "🎤 Gerar automática", command=self.on_auto_lyrics,
+                         style="primary", padx=12, pady=6).pack(side="right", padx=(0, 6))
 
         # Canvas + scrollbar for strophe cards
         container = tk.Frame(self, bg=DARK["bg"])
-        container.pack(fill="both", expand=True, padx=4)
+        container.pack(fill="both", expand=True)
 
         self.canvas = tk.Canvas(container, bg=DARK["bg"], highlightthickness=0)
         scrollbar = ttk.Scrollbar(container, orient="vertical", command=self.canvas.yview)
         self.scrollable_frame = tk.Frame(self.canvas, bg=DARK["bg"])
-
         self.scrollable_frame.bind(
             "<Configure>",
             lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         )
-
         self.canvas_window = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
         self.canvas.configure(yscrollcommand=scrollbar.set)
         self.canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-
-        # Mousewheel
         bind_wheel_scroll(self.canvas)
-
         self.canvas.bind("<Configure>", self._on_canvas_resize)
 
         self.refresh()
@@ -1282,61 +1382,94 @@ class StropheList(tk.Frame):
     def _on_canvas_resize(self, event):
         self.canvas.itemconfig(self.canvas_window, width=event.width)
 
+    def sorted_strophes(self) -> List[Strophe]:
+        return sorted(self.project.strophes, key=lambda s: s.start_time)
+
     def refresh(self):
         for w in self.scrollable_frame.winfo_children():
             w.destroy()
+        self._cards = {}
 
-        strophes = sorted(self.project.strophes, key=lambda s: s.start_time)
+        strophes = self.sorted_strophes()
+        n = len(strophes)
+        self.count_label.config(text=f"· {n} estrofe{'s' if n != 1 else ''}" if n else "")
+        if self.selected_id not in {s.id for s in strophes}:
+            self.selected_id = strophes[0].id if strophes else None
 
         if not strophes:
             tk.Label(self.scrollable_frame,
-                     text="Nenhuma estrofe.\nClique em '+ Nova Estrofe' para adicionar.",
+                     text="Nenhuma estrofe ainda.\n\nEscolha o áudio e clique em "
+                          "🎤 Gerar automática,\nou adicione com + Nova / 📋 Colar.",
                      bg=DARK["bg"], fg=DARK["text_dim"],
-                     font=("Segoe UI", 11), justify="center").pack(pady=40)
+                     font=(UI_FONT, 11), justify="center").pack(pady=60)
             return
 
         for i, s in enumerate(strophes):
-            self._strophe_card(self.scrollable_frame, s, i, is_last=i == len(strophes) - 1)
+            self._strophe_card(self.scrollable_frame, s, i, is_last=i == n - 1)
+
+    def select(self, sid: Optional[int]):
+        self.selected_id = sid
+        for card_sid, card in self._cards.items():
+            card.config(highlightbackground=DARK["selected"] if card_sid == sid else DARK["surface"])
+        if self.on_select:
+            self.on_select(sid)
 
     def _strophe_card(self, parent, s: Strophe, idx: int, is_last: bool = False):
-        card = tk.Frame(parent, bg=DARK["surface"], pady=0)
-        card.pack(fill="x", padx=8, pady=4)
+        selected = s.id == self.selected_id
+        card = tk.Frame(parent, bg=DARK["surface"], highlightthickness=2,
+                        highlightbackground=DARK["selected"] if selected else DARK["surface"],
+                        cursor="hand2")
+        card.pack(fill="x", padx=(8, 4), pady=4)
+        self._cards[s.id] = card
 
         # Color accent strip
-        accent_color = DARK["accent"] if idx % 2 == 0 else DARK["accent2"]
-        strip = tk.Frame(card, bg=accent_color, width=4)
+        strip = tk.Frame(card, bg=DARK["accent"] if idx % 2 == 0 else DARK["accent2"], width=4)
         strip.pack(side="left", fill="y")
 
         inner = tk.Frame(card, bg=DARK["surface"])
-        inner.pack(side="left", fill="both", expand=True, padx=10, pady=8)
+        inner.pack(side="left", fill="both", expand=True, padx=12, pady=10)
 
         # Top row: time and buttons
         top = tk.Frame(inner, bg=DARK["surface"])
         top.pack(fill="x")
 
         n_lines = len([l for l in s.text.split("\n") if l.strip()])
-        time_str = (f"⏱  {format_time(s.start_time)}  →  {format_time(s.end_time)}"
-                    f"   ({s.end_time - s.start_time:.1f}s · "
-                    f"{n_lines} linha{'s' if n_lines != 1 else ''})")
-        tk.Label(top, text=time_str, bg=DARK["surface"], fg=DARK["accent"],
-                 font=("Courier New", 10, "bold")).pack(side="left")
+        time_str = (f"{format_time(s.start_time)}  →  {format_time(s.end_time)}")
+        tk.Label(top, text=time_str, bg=DARK["surface"], fg=DARK["text"],
+                 font=("Consolas", 10, "bold")).pack(side="left")
+        tk.Label(top, text=f"   {s.end_time - s.start_time:.1f}s · "
+                           f"{n_lines} linha{'s' if n_lines != 1 else ''}",
+                 bg=DARK["surface"], fg=DARK["text_dim"], font=(UI_FONT, 9)).pack(side="left")
 
         StyledButton(top, "✎", command=lambda sid=s.id: self._edit(sid),
-                     style="secondary", padx=6, pady=2,
-                     font=("Segoe UI", 9)).pack(side="right", padx=(4, 0))
+                     style="secondary", padx=7, pady=1,
+                     font=(UI_FONT, 9)).pack(side="right", padx=(4, 0))
         StyledButton(top, "✕", command=lambda sid=s.id: self._delete(sid),
-                     style="danger", padx=6, pady=2,
-                     font=("Segoe UI", 9)).pack(side="right")
+                     style="danger", padx=7, pady=1,
+                     font=(UI_FONT, 9)).pack(side="right")
         if not is_last:
             StyledButton(top, "↓ Juntar", command=lambda sid=s.id: self._merge_next(sid),
-                         style="secondary", padx=6, pady=2,
-                         font=("Segoe UI", 9)).pack(side="right", padx=(0, 4))
+                         style="secondary", padx=7, pady=1,
+                         font=(UI_FONT, 9)).pack(side="right", padx=(0, 4))
 
-        # Lyrics preview
-        preview = s.text.strip()[:120] + ("…" if len(s.text.strip()) > 120 else "")
-        tk.Label(inner, text=preview, bg=DARK["surface"], fg=DARK["text"],
-                 font=("Segoe UI", 10), anchor="w", justify="left",
-                 wraplength=600).pack(fill="x", pady=(4, 0))
+        # Lyrics
+        tk.Label(inner, text=s.text.strip(), bg=DARK["surface"], fg=DARK["text"],
+                 font=(UI_FONT, 10), anchor="w", justify="left",
+                 wraplength=560).pack(fill="x", pady=(6, 0))
+
+        # Click anywhere (except the buttons) selects the card
+        def bind_select(w):
+            if not isinstance(w, tk.Button):
+                w.bind("<Button-1>", lambda e, sid=s.id: self.select(sid))
+                w.bind("<Double-Button-1>", lambda e, sid=s.id: self._edit(sid))
+            for child in w.winfo_children():
+                bind_select(child)
+        bind_select(card)
+
+    def _changed(self):
+        self.refresh()
+        if self.on_change:
+            self.on_change()
 
     def _add_strophe(self):
         next_start, next_end = next_strophe_times(self.project.strophes)
@@ -1344,9 +1477,8 @@ class StropheList(tk.Frame):
         def on_save(s: Strophe):
             s.id = max((x.id for x in self.project.strophes), default=0) + 1
             self.project.strophes.append(s)
-            self.refresh()
-            if self.on_change:
-                self.on_change()
+            self.selected_id = s.id
+            self._changed()
 
         StropheEditor(self, on_save=on_save,
                       default_start=next_start, default_end=next_end)
@@ -1360,30 +1492,24 @@ class StropheList(tk.Frame):
             new_s.id = sid
             idx = next(i for i, x in enumerate(self.project.strophes) if x.id == sid)
             self.project.strophes[idx] = new_s
-            self.refresh()
-            if self.on_change:
-                self.on_change()
+            self._changed()
 
         StropheEditor(self, strophe=s, on_save=on_save)
 
     def _merge_next(self, sid: int):
         """Join this strophe with the one below it."""
         self.project.strophes = merge_with_next(self.project.strophes, sid)
-        self.refresh()
-        if self.on_change:
-            self.on_change()
+        self.selected_id = sid
+        self._changed()
 
     def _delete(self, sid: int):
         if messagebox.askyesno("Confirmar", "Remover esta estrofe?"):
             self.project.strophes = [s for s in self.project.strophes if s.id != sid]
-            self.refresh()
-            if self.on_change:
-                self.on_change()
+            self._changed()
 
     def _paste_block(self):
         """Quick paste dialog: paste multiple strophes at once."""
-        PasteBlockDialog(self, self.project, on_done=lambda: (self.refresh(),
-                                                               self.on_change() if self.on_change else None))
+        PasteBlockDialog(self, self.project, on_done=self._changed)
 
 
 class PasteBlockDialog(tk.Toplevel):
@@ -1466,7 +1592,7 @@ class PasteBlockDialog(tk.Toplevel):
         self.destroy()
 
 
-class AutoLyricsDialog(tk.Toplevel):
+class AutoLyricsDialog(WorkerMixin, tk.Toplevel):
     """
     Generate timed strophes from the audio with Whisper (auto_lyrics.py).
     With lyrics pasted, the text is kept and only the timing is detected;
@@ -1474,49 +1600,46 @@ class AutoLyricsDialog(tk.Toplevel):
     """
     LANGUAGES = {"Português": "pt", "Inglês": "en", "Espanhol": "es", "Detectar": None}
 
-    def __init__(self, parent, project: Project, on_audio_change=None, on_done=None):
+    def __init__(self, parent, project: Project, options: Optional[dict] = None,
+                 on_options=None, on_done=None, ask_before_replace: bool = True):
         super().__init__(parent)
         self.project = project
-        self.on_audio_change = on_audio_change
+        self.options = options or {}
+        self.on_options = on_options
         self.on_done = on_done
+        self.ask_before_replace = ask_before_replace
         self.cancelled = False
         self.running = False
-        self.title("Gerar Legenda Automática")
+        self.title("Gerar legenda automática")
         self.configure(bg=DARK["bg"])
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._cancel)
         self._build()
-        self.geometry("640x620")
+        self.geometry("640x640")
         self.transient(parent)
 
     def _build(self):
-        pad = {"padx": 16}
-        tk.Label(self, text="🎤  Gerar Legenda Automática", bg=DARK["bg"], fg=DARK["text"],
-                 font=("Segoe UI", 13, "bold")).pack(anchor="w", pady=(14, 8), **pad)
-
-        # Audio
-        row = tk.Frame(self, bg=DARK["bg"])
-        row.pack(fill="x", **pad)
-        tk.Label(row, text="Áudio:", bg=DARK["bg"], fg=DARK["text_dim"],
-                 font=("Segoe UI", 9), width=8, anchor="w").pack(side="left")
-        self.audio_var = tk.StringVar(value=self.project.audio_file)
-        tk.Entry(row, textvariable=self.audio_var, bg=DARK["entry_bg"], fg=DARK["text"],
-                 insertbackground=DARK["text"], relief="flat", font=("Segoe UI", 9),
-                 bd=4).pack(side="left", fill="x", expand=True, padx=(0, 6))
-        StyledButton(row, "...", command=self._pick_audio, style="secondary",
-                     padx=8, pady=4).pack(side="left")
+        pad = {"padx": 20}
+        tk.Label(self, text="🎤  Gerar legenda automática", bg=DARK["bg"], fg=DARK["text"],
+                 font=(UI_FONT, 13, "bold")).pack(anchor="w", pady=(16, 2), **pad)
+        tk.Label(self, text=f"Música: {os.path.basename(self.project.audio_file)}",
+                 bg=DARK["bg"], fg=DARK["text_dim"], font=(UI_FONT, 9)).pack(anchor="w", **pad)
 
         # Options
         opt = tk.Frame(self, bg=DARK["bg"])
-        opt.pack(fill="x", pady=(8, 0), **pad)
-        tk.Label(opt, text="Idioma:", bg=DARK["bg"], fg=DARK["text_dim"],
-                 font=("Segoe UI", 9), width=8, anchor="w").pack(side="left")
-        self.lang_var = tk.StringVar(value="Português")
+        opt.pack(fill="x", pady=(12, 0), **pad)
+        tk.Label(opt, text="Idioma", bg=DARK["bg"], fg=DARK["text_dim"],
+                 font=(UI_FONT, 9)).pack(side="left", padx=(0, 6))
+        lang = self.options.get("language", "Português")
+        self.lang_var = tk.StringVar(value=lang if lang in self.LANGUAGES else "Português")
         ttk.Combobox(opt, textvariable=self.lang_var, values=list(self.LANGUAGES),
                      state="readonly", width=12).pack(side="left")
-        tk.Label(opt, text="Modelo:", bg=DARK["bg"], fg=DARK["text_dim"],
-                 font=("Segoe UI", 9)).pack(side="left", padx=(16, 6))
-        self.model_var = tk.StringVar(value=auto_lyrics.MODELS[auto_lyrics.DEFAULT_MODEL])
+        tk.Label(opt, text="Modelo", bg=DARK["bg"], fg=DARK["text_dim"],
+                 font=(UI_FONT, 9)).pack(side="left", padx=(18, 6))
+        model = self.options.get("whisper_model", auto_lyrics.DEFAULT_MODEL)
+        if model not in auto_lyrics.MODELS:
+            model = auto_lyrics.DEFAULT_MODEL
+        self.model_var = tk.StringVar(value=auto_lyrics.MODELS[model])
         model_box = ttk.Combobox(opt, textvariable=self.model_var,
                                  values=list(auto_lyrics.MODELS.values()),
                                  state="readonly", width=16)
@@ -1524,43 +1647,40 @@ class AutoLyricsDialog(tk.Toplevel):
         model_box.bind("<<ComboboxSelected>>", lambda _: self._show_model_status())
 
         # Lyrics
-        tk.Label(self, text="Letra (opcional, mas deixa bem mais preciso):", bg=DARK["bg"],
-                 fg=DARK["text"], font=("Segoe UI", 10, "bold")).pack(
-            anchor="w", pady=(14, 2), **pad)
-        tk.Label(self, text="Cole a letra com as estrofes separadas por linha em branco — "
-                            "o texto fica igualzinho e só os tempos são detectados.\n"
+        tk.Label(self, text="Letra (opcional, mas deixa bem mais preciso)", bg=DARK["bg"],
+                 fg=DARK["text"], font=(UI_FONT, 10, "bold")).pack(anchor="w", pady=(16, 2), **pad)
+        tk.Label(self, text="Cole a letra com as estrofes separadas por linha em branco — o texto "
+                            "fica igualzinho e só os tempos são detectados.\n"
                             "Sem letra, a IA escreve sozinha (pode errar algumas palavras).",
-                 bg=DARK["bg"], fg=DARK["text_dim"], font=("Segoe UI", 8),
+                 bg=DARK["bg"], fg=DARK["text_dim"], font=(UI_FONT, 8),
                  justify="left").pack(anchor="w", **pad)
+        self.ignore_tags_var = tk.BooleanVar(value=self.options.get("ignore_tags", True))
+        tk.Checkbutton(self, text="Ignorar o que estiver entre [ ]  (ex.: [refrão], igual ao Suno)",
+                       variable=self.ignore_tags_var, bg=DARK["bg"], fg=DARK["text"],
+                       activebackground=DARK["bg"], activeforeground=DARK["text"],
+                       selectcolor=DARK["entry_bg"], font=(UI_FONT, 9)).pack(anchor="w", pady=(6, 0), padx=16)
         tf = tk.Frame(self, bg=DARK["border"], padx=1, pady=1)
         tf.pack(fill="both", expand=True, pady=(6, 0), **pad)
         self.lyrics_text = tk.Text(tf, bg=DARK["entry_bg"], fg=DARK["text"],
-                                   insertbackground=DARK["text"], font=("Segoe UI", 10),
+                                   insertbackground=DARK["text"], font=(UI_FONT, 10),
                                    relief="flat", bd=8, wrap="word", height=10)
         self.lyrics_text.pack(fill="both", expand=True)
 
         # Progress
         self.status_label = tk.Label(self, text="", bg=DARK["bg"], fg=DARK["text_dim"],
-                                     font=("Segoe UI", 9))
-        self._show_model_status()
+                                     font=(UI_FONT, 9))
         self.status_label.pack(anchor="w", pady=(10, 2), **pad)
+        self._show_model_status()
         self.progress_bar = ttk.Progressbar(self, mode="determinate")
         self.progress_bar.pack(fill="x", **pad)
 
         # Buttons
         bf = tk.Frame(self, bg=DARK["bg"])
-        bf.pack(fill="x", pady=12, **pad)
-        self.cancel_btn = StyledButton(bf, "✕  Cancelar", command=self._cancel, style="secondary")
+        bf.pack(fill="x", pady=14, **pad)
+        self.cancel_btn = StyledButton(bf, "Cancelar", command=self._cancel, style="secondary")
         self.cancel_btn.pack(side="right", padx=(8, 0))
         self.gen_btn = StyledButton(bf, "🎤  Gerar", command=self._start)
         self.gen_btn.pack(side="right")
-
-    def _pick_audio(self):
-        path = filedialog.askopenfilename(
-            parent=self,
-            filetypes=[("Áudio", "*.mp3 *.wav *.ogg *.aac *.m4a *.flac"), ("Todos", "*.*")])
-        if path:
-            self.audio_var.set(path)
 
     def _show_model_status(self):
         model = self._model_size()
@@ -1579,24 +1699,29 @@ class AutoLyricsDialog(tk.Toplevel):
     def _cancel(self):
         self.cancelled = True
         self.running = False
+        if getattr(self, "_events", None) is not None:
+            self.stop_worker()
         self.destroy()
 
     def _start(self):
-        audio = self.audio_var.get().strip()
+        audio = self.project.audio_file
         if not audio or not os.path.isfile(audio):
-            messagebox.showerror("Erro", "Escolha o arquivo de áudio da música.", parent=self)
+            messagebox.showerror("Erro", "O arquivo de áudio não foi encontrado.", parent=self)
             return
         if not auto_lyrics.is_available():
             messagebox.showerror("Whisper não instalado",
-                                 "Instale o Whisper com:\n\n    pip install faster-whisper\n\n"
-                                 "e abra o programa de novo.", parent=self)
+                                 "A legenda automática precisa do faster-whisper.\n\n"
+                                 "Feche e abra o programa de novo pra instalar, ou rode:\n"
+                                 "    pip install faster-whisper", parent=self)
             return
-        if audio != self.project.audio_file and self.on_audio_change:
-            self.on_audio_change(audio)  # also use it for the render
 
         lyrics = self.lyrics_text.get("1.0", "end-1c")
         model = self._model_size()
         language = self.LANGUAGES.get(self.lang_var.get(), "pt")
+        ignore_tags = self.ignore_tags_var.get()
+        if self.on_options:
+            self.on_options({"whisper_model": model, "language": self.lang_var.get(),
+                             "ignore_tags": ignore_tags})
 
         self.gen_btn.config(state="disabled")
         self.cancel_btn.config(text="⏹  Parar")
@@ -1609,30 +1734,15 @@ class AutoLyricsDialog(tk.Toplevel):
         self.progress_bar.start(12)
         self.running = True
 
-        # The worker never touches Tk: it queues callbacks that _poll runs
-        # on the main thread.
-        events = queue.Queue()
-        post = events.put
-
-        def poll():
-            try:
-                while True:
-                    events.get_nowait()()
-            except queue.Empty:
-                pass
-            if self.running:
-                self.after(100, poll)
-
-        self.after(100, poll)
-
         def progress(p):
-            post(lambda v=int(p * 100): self._set_progress(v))
+            self.post(lambda v=int(p * 100): self._set_progress(v))
 
         def run():
             try:
                 result = auto_lyrics.generate(audio, lyrics, model, language,
                                               progress=progress,
-                                              cancel=lambda: self.cancelled)
+                                              cancel=lambda: self.cancelled,
+                                              ignore_tags=ignore_tags)
                 outcome = (True, result)
             except auto_lyrics.Cancelled:
                 return
@@ -1641,9 +1751,9 @@ class AutoLyricsDialog(tk.Toplevel):
             except Exception as e:
                 outcome = (False, f"Erro inesperado: {e}")
             if not self.cancelled:
-                post(lambda: self._on_done(*outcome))
+                self.post(lambda: self._on_done(*outcome))
 
-        threading.Thread(target=run, daemon=True).start()
+        self.start_worker(run)
 
     def _set_progress(self, pct: int):
         try:
@@ -1655,26 +1765,30 @@ class AutoLyricsDialog(tk.Toplevel):
         except tk.TclError:
             pass
 
+    def _reset_buttons(self):
+        self.gen_btn.config(state="normal")
+        self.cancel_btn.config(text="Cancelar")
+
     def _on_done(self, ok: bool, result):
         self.running = False
+        if getattr(self, "_events", None) is not None:
+            self.stop_worker()
         self.progress_bar.stop()
         self.progress_bar.config(mode="determinate")
         if not ok:
             self.status_label.config(text="❌  Erro ao gerar a legenda", fg=DARK["accent"])
-            self.gen_btn.config(state="normal")
-            self.cancel_btn.config(text="✕  Cancelar")
+            self._reset_buttons()
             messagebox.showerror("Erro", result, parent=self)
             return
         if not result:
-            self.gen_btn.config(state="normal")
+            self._reset_buttons()
             messagebox.showwarning("Nada encontrado", "Nenhuma estrofe foi gerada.", parent=self)
             return
-        if self.project.strophes and not messagebox.askyesno(
+        if self.ask_before_replace and self.project.strophes and not messagebox.askyesno(
                 "Substituir estrofes?",
                 f"O projeto já tem {len(self.project.strophes)} estrofe(s).\n"
                 f"Substituir pelas {len(result)} geradas?", parent=self):
-            self.gen_btn.config(state="normal")
-            self.cancel_btn.config(text="✕  Cancelar")
+            self._reset_buttons()
             return
 
         self.project.strophes = [Strophe(id=i + 1, start_time=s.start, end_time=s.end, text=s.text)
@@ -1683,16 +1797,19 @@ class AutoLyricsDialog(tk.Toplevel):
             self.on_done()
         messagebox.showinfo("Pronto",
                             f"{len(result)} estrofe(s) gerada(s)!\n\n"
-                            "Revise os tempos e o texto antes de renderizar.", parent=self)
+                            "Confira os tempos e o texto antes de renderizar.", parent=self)
         self.destroy()
 
 
-class RenderDialog(tk.Toplevel):
-    def __init__(self, parent, project: Project):
+class RenderDialog(WorkerMixin, tk.Toplevel):
+    """Progress window for rendering to `out_path` (starts right away)."""
+
+    def __init__(self, parent, project: Project, out_path: str, autostart: bool = True):
         super().__init__(parent)
         self.project = project
+        self.out_path = out_path
         self.cancelled = False
-        self.title("Renderizar Vídeo")
+        self.title("Renderizando")
         self.configure(bg=DARK["bg"])
         self.resizable(False, False)
         self.grab_set()
@@ -1704,108 +1821,46 @@ class RenderDialog(tk.Toplevel):
         x = parent.winfo_x() + (parent.winfo_width() - self.winfo_width()) // 2
         y = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
         self.geometry(f"+{x}+{y}")
+        if autostart:
+            self.after(50, self._start_render)
 
     def _build(self):
-        tk.Label(self, text="🎬  Renderizar Vídeo", bg=DARK["bg"],
-                 fg=DARK["text"], font=("Segoe UI", 13, "bold")).pack(pady=(20, 8), padx=24)
+        tk.Label(self, text="🎬  Renderizando vídeo", bg=DARK["bg"],
+                 fg=DARK["text"], font=(UI_FONT, 13, "bold")).pack(anchor="w", pady=(20, 4), padx=24)
+        tk.Label(self, text=self.out_path, bg=DARK["bg"], fg=DARK["text_dim"],
+                 font=(UI_FONT, 8), wraplength=440, justify="left").pack(anchor="w", padx=24)
 
-        # Output path
-        pf = tk.Frame(self, bg=DARK["bg"])
-        pf.pack(fill="x", padx=24, pady=8)
-        tk.Label(pf, text="Salvar em:", bg=DARK["bg"], fg=DARK["text_dim"],
-                 font=("Segoe UI", 9)).pack(anchor="w")
-        row = tk.Frame(pf, bg=DARK["bg"])
-        row.pack(fill="x", pady=(4, 0))
+        self.progress_label = tk.Label(self, text="Preparando…", bg=DARK["bg"],
+                                       fg=DARK["text_dim"], font=(UI_FONT, 9))
+        self.progress_label.pack(anchor="w", padx=24, pady=(16, 4))
+        self.progress_bar = ttk.Progressbar(self, length=440, mode="determinate")
+        self.progress_bar.pack(padx=24)
 
-        default_out = self.project.output_file or os.path.join(
-            os.path.expanduser("~"), f"{safe_filename(self.project.title)}.mp4"
-        )
-        self.out_var = tk.StringVar(value=default_out)
-        e = tk.Entry(row, textvariable=self.out_var, bg=DARK["entry_bg"], fg=DARK["text"],
-                     insertbackground=DARK["text"], relief="flat", font=("Segoe UI", 10), bd=4)
-        e.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        StyledButton(row, "...", command=self._pick_out, style="secondary",
-                     padx=8, pady=4).pack(side="left")
-
-        # Format info
-        tk.Label(self,
-                 text=".mp4 → com fundo  |  .webm → com transparência (gerado automaticamente se fundo transparente)",
-                 bg=DARK["bg"], fg=DARK["text_dim"], font=("Segoe UI", 8)).pack(padx=24)
-
-        # Progress
-        tk.Label(self, text="", bg=DARK["bg"], height=1).pack()
-        self.progress_label = tk.Label(self, text="Pronto para renderizar.",
-                                       bg=DARK["bg"], fg=DARK["text_dim"],
-                                       font=("Segoe UI", 9))
-        self.progress_label.pack(padx=24)
-
-        self.progress_bar = ttk.Progressbar(self, length=400, mode="determinate")
-        self.progress_bar.pack(padx=24, pady=8)
-
-        self.status_label = tk.Label(self, text="", bg=DARK["bg"],
-                                     fg=DARK["text_dim"], font=("Segoe UI", 8))
-        self.status_label.pack(padx=24)
-
-        # Buttons
         bf = tk.Frame(self, bg=DARK["bg"])
-        bf.pack(fill="x", padx=24, pady=(16, 20))
-
-        self.cancel_btn = StyledButton(bf, "✕  Cancelar", command=self._cancel,
-                                       style="secondary")
-        self.cancel_btn.pack(side="right", padx=(8, 0))
-
-        self.render_btn = StyledButton(bf, "▶  Iniciar Renderização",
-                                       command=self._start_render)
-        self.render_btn.pack(side="right")
-
-    def _pick_out(self):
-        path = filedialog.asksaveasfilename(
-            defaultextension=".mp4",
-            filetypes=[("MP4 Video", "*.mp4"), ("WebM transparente", "*.webm"),
-                       ("Todos", "*.*")],
-            initialfile=f"{safe_filename(self.project.title)}.mp4"
-        )
-        if path:
-            self.out_var.set(path)
-            self.project.output_file = path
+        bf.pack(fill="x", padx=24, pady=(18, 20))
+        self.cancel_btn = StyledButton(bf, "⏹  Parar", command=self._cancel, style="secondary")
+        self.cancel_btn.pack(side="right")
 
     def _cancel(self):
         self.cancelled = True
+        if getattr(self, "_events", None) is not None:
+            self.stop_worker()
         self.destroy()
 
     def _start_render(self):
-        out = self.out_var.get().strip()
-        if not out:
-            messagebox.showerror("Erro", "Escolha onde salvar o vídeo.", parent=self)
+        if self.cancelled:
             return
-
-        if not self.project.strophes:
-            messagebox.showerror("Erro", "Adicione ao menos uma estrofe.", parent=self)
-            return
-
-        self.project.output_file = out
-        self.render_btn.config(state="disabled")
-        self.cancel_btn.config(text="⏹  Parar")
-        self.cancelled = False
-
         try:
             renderer = FrameRenderer(self.project)
         except Exception as e:
-            self.render_btn.config(state="normal")
             messagebox.showerror("Erro", f"Não foi possível preparar o render:\n{e}", parent=self)
+            self.destroy()
             return
-
-        # IMPORTANT: never touch tkinter widgets from background thread on Windows.
-        # Use after() to post updates back to the main thread.
-        def post(fn):
-            try:
-                self.after(0, fn)
-            except (tk.TclError, RuntimeError):
-                pass  # dialog was closed while rendering
+        self.project.output_file = self.out_path
+        out = self.out_path
 
         def progress(p):
-            pct = int(p * 100)
-            post(lambda v=pct: self._set_progress(v))
+            self.post(lambda v=int(p * 100): self._set_progress(v))
 
         def run():
             try:
@@ -1818,155 +1873,423 @@ class RenderDialog(tk.Toplevel):
             except Exception as e:
                 ok, msg = False, f"Erro inesperado: {e}"
             if not self.cancelled:
-                post(lambda: self._on_done(ok, msg))
+                self.post(lambda: self._on_done(ok, msg))
 
-        threading.Thread(target=run, daemon=True).start()
-        self.progress_label.config(text="Iniciando…")
+        self.start_worker(run)
 
     def _set_progress(self, pct: int):
-        """Thread-safe progress update — called only on main thread."""
         try:
             self.progress_bar["value"] = pct
             self.progress_label.config(text=f"Renderizando… {pct}%")
-        except Exception:
+        except tk.TclError:
             pass
 
     def _on_done(self, ok: bool, msg: str):
+        self.stop_worker()
         if ok:
-            self.progress_label.config(text="✅  Renderização concluída!", fg=DARK["success"])
-            self.render_btn.config(state="normal")
-            if messagebox.askyesno("Concluído", f"Vídeo salvo em:\n{msg}\n\nAbrir pasta?", parent=self):
-                folder = os.path.dirname(msg)
-                if sys.platform == "win32":
-                    os.startfile(folder)
-                elif sys.platform == "darwin":
-                    subprocess.run(["open", folder])
-                else:
-                    subprocess.run(["xdg-open", folder])
+            self.progress_label.config(text="✅  Pronto!", fg=DARK["success"])
+            if messagebox.askyesno("Vídeo pronto", f"Vídeo salvo em:\n{msg}\n\nAbrir a pasta?",
+                                   parent=self):
+                open_folder(os.path.dirname(os.path.abspath(msg)))
             self.destroy()
         else:
             self.progress_label.config(text="❌  Erro na renderização", fg=DARK["accent"])
-            self.render_btn.config(state="normal")
+            self.cancel_btn.config(text="Fechar")
             messagebox.showerror("Erro", msg, parent=self)
 
 
+class SongPanel(tk.Frame):
+    """Left column: audio, title, background, the preview and the render button."""
+    PREVIEW_W, PREVIEW_H = 400, 225
+    THUMB_W, THUMB_H = 96, 54
+
+    def __init__(self, parent, on_pick_audio=None, on_title_change=None, on_pick_bg=None,
+                 on_clear_bg=None, on_render=None):
+        super().__init__(parent, bg=DARK["bg"])
+        self.on_title_change = on_title_change
+        self._suspend_title_cb = False
+        self._thumb = self._preview = None
+        # Label sizes are in characters unless they hold an image: blank
+        # images keep the boxes at a fixed pixel size while empty
+        self._blank_thumb = tk.PhotoImage(master=self, width=self.THUMB_W, height=self.THUMB_H)
+        self._blank_preview = tk.PhotoImage(master=self, width=self.PREVIEW_W, height=self.PREVIEW_H)
+
+        # ── Song card ──────────────────────────────────
+        card = tk.Frame(self, bg=DARK["surface"], padx=16, pady=14)
+        card.pack(fill="x")
+        section_title(card, "Música", DARK["surface"]).pack(anchor="w", pady=(0, 8))
+
+        def row(label):
+            r = tk.Frame(card, bg=DARK["surface"])
+            r.pack(fill="x", pady=4)
+            tk.Label(r, text=label, bg=DARK["surface"], fg=DARK["text_dim"],
+                     font=(UI_FONT, 9), width=6, anchor="w").pack(side="left")
+            return r
+
+        r = row("Áudio")
+        StyledButton(r, "Escolher…", command=on_pick_audio, style="secondary",
+                     padx=10, pady=4, font=(UI_FONT, 9)).pack(side="right")
+        self.audio_label = tk.Label(r, text="", bg=DARK["entry_bg"], fg=DARK["text"],
+                                    font=(UI_FONT, 10), anchor="w", padx=8, pady=6)
+        self.audio_label.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        r = row("Título")
+        self.title_var = tk.StringVar()
+        self.title_var.trace_add("write", self._title_written)
+        self.title_entry = styled_entry(r, self.title_var, font_size=11)
+        self.title_entry.pack(side="left", fill="x", expand=True)
+
+        r = row("Fundo")
+        self.bg_thumb = tk.Label(r, bg=DARK["entry_bg"], image=self._blank_thumb, bd=0,
+                                 cursor="hand2")
+        self.bg_thumb.pack(side="left")
+        self.bg_thumb.bind("<Button-1>", lambda e: on_pick_bg and on_pick_bg())
+        col = tk.Frame(r, bg=DARK["surface"])
+        col.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        self.bg_label = tk.Label(col, text="", bg=DARK["surface"], fg=DARK["text_dim"],
+                                 font=(UI_FONT, 9), anchor="w", justify="left", wraplength=230)
+        self.bg_label.pack(anchor="w")
+        btns = tk.Frame(col, bg=DARK["surface"])
+        btns.pack(anchor="w", pady=(6, 0))
+        StyledButton(btns, "Escolher…", command=on_pick_bg, style="secondary",
+                     padx=10, pady=4, font=(UI_FONT, 9)).pack(side="left")
+        self.bg_clear_btn = StyledButton(btns, "Remover", command=on_clear_bg, style="ghost",
+                                         padx=10, pady=4, font=(UI_FONT, 9))
+        self.bg_clear_btn.pack(side="left", padx=(6, 0))
+
+        # ── Preview card ───────────────────────────────
+        pcard = tk.Frame(self, bg=DARK["surface"], padx=16, pady=14)
+        pcard.pack(fill="x", pady=(12, 0))
+        section_title(pcard, "Prévia", DARK["surface"]).pack(anchor="w", pady=(0, 8))
+        self.preview_label = tk.Label(pcard, bg="#000000", image=self._blank_preview, bd=0)
+        self.preview_label.pack()
+        self.preview_caption = tk.Label(pcard, text="", bg=DARK["surface"], fg=DARK["text_dim"],
+                                        font=(UI_FONT, 9))
+        self.preview_caption.pack(anchor="w", pady=(8, 0))
+
+        # ── Render ─────────────────────────────────────
+        self.render_btn = StyledButton(self, "▶   Renderizar vídeo", command=on_render,
+                                       font=(UI_FONT, 12, "bold"), pady=12)
+        self.render_btn.pack(fill="x", side="bottom", pady=(12, 0))
+
+    # ── Setters (called by App) ─────────────────────────
+
+    def set_audio(self, path: str):
+        self.audio_label.config(text=os.path.basename(path) if path else "Nenhum áudio escolhido",
+                                fg=DARK["text"] if path else DARK["text_dim"])
+
+    def set_title(self, title: str):
+        self._suspend_title_cb = True
+        self.title_var.set(title)
+        self._suspend_title_cb = False
+
+    def _title_written(self, *_):
+        if not self._suspend_title_cb and self.on_title_change:
+            self.on_title_change(self.title_var.get())
+
+    def set_background(self, path: str, hint: str):
+        self._thumb = None
+        if path and HAS_PIL:
+            try:
+                img = Image.open(path).convert("RGB")
+                img = img.resize((self.THUMB_W, self.THUMB_H), Image.LANCZOS)
+                self._thumb = ImageTk.PhotoImage(img, master=self)
+            except Exception:
+                self._thumb = None
+        self.bg_thumb.config(image=self._thumb or self._blank_thumb)
+        self.bg_label.config(text=os.path.basename(path) if path else hint,
+                             fg=DARK["text"] if path else DARK["text_dim"])
+        if path:
+            self.bg_clear_btn.pack(side="left", padx=(6, 0))
+        else:
+            self.bg_clear_btn.pack_forget()
+
+    def show_preview(self, img, caption: str):
+        self._preview = ImageTk.PhotoImage(img, master=self) if img is not None else None
+        self.preview_label.config(image=self._preview or self._blank_preview)
+        self.preview_caption.config(text=caption)
+
+
+def _checkerboard(w: int, h: int, size: int = 10):
+    """Gray checkerboard to show where the video is transparent."""
+    img = Image.new("RGBA", (w, h), (44, 44, 54, 255))
+    d = ImageDraw.Draw(img)
+    for y in range(0, h, size):
+        for x in range((y // size) % 2 * size, w, size * 2):
+            d.rectangle((x, y, x + size - 1, y + size - 1), fill=(60, 60, 72, 255))
+    return img
+
+
+def render_preview(project: Project, text: str, w: int, h: int):
+    """
+    How a strophe looks in the video (title + text over the background),
+    scaled to w×h. Transparent backgrounds are shown over a checkerboard.
+    """
+    p = replace(project, strophes=[Strophe(0, 0.0, 10.0, text or " ")], fade_duration=0.0)
+    renderer = FrameRenderer(p)
+    frame = renderer.render_frame(5.0).resize((w, h), Image.LANCZOS)
+    if renderer._transparent:
+        frame = Image.alpha_composite(_checkerboard(w, h), frame)
+    return frame.convert("RGB")
+
+
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, config_file: Optional[str] = None):
         super().__init__()
         self.title("LyricRenderer")
         self.configure(bg=DARK["bg"])
         self.geometry("1280x800")
-        self.minsize(900, 600)
+        self.minsize(1040, 660)
 
-        self.project = Project()
+        self.config_file = config_file or config_path()
+        self.cfg = load_config(self.config_file)
+        self.project = self._fresh_project()
         self._current_file = None
+        self._lyrics_audio = None   # audio the current strophes were made for
+        self._preview_job = None
 
+        self._set_icon()
         self._setup_styles()
-        self._build_menu()
         self._build_ui()
+        self._bind_keys()
+        self._sync_song_panel()
+        self._on_project_change()
+
+    # ── Setup ─────────────────────────────────
+
+    def _fresh_project(self) -> Project:
+        """New project with the saved style and the last background image."""
+        p = Project(title="")
+        apply_style(p, self.cfg)
+        bg = self.cfg.get("bg_image", "")
+        if isinstance(bg, str) and bg and os.path.isfile(bg):
+            p.bg_image = bg
+        return p
+
+    def _save_cfg(self, **changes):
+        self.cfg.update(changes)
+        save_config(self.cfg, self.config_file)
+
+    def _set_icon(self):
+        ico = os.path.join(_default_assets_dir(), "icon.ico")
+        png = os.path.join(_default_assets_dir(), "icon.png")
+        try:
+            if sys.platform == "win32" and os.path.isfile(ico):
+                self.iconbitmap(default=ico)
+            elif os.path.isfile(png):
+                self._icon_png = tk.PhotoImage(master=self, file=png)
+                self.iconphoto(True, self._icon_png)
+        except tk.TclError:
+            pass
 
     def _setup_styles(self):
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure("TScrollbar", background=DARK["surface"], troughcolor=DARK["bg"],
-                        bordercolor=DARK["bg"], arrowcolor=DARK["text_dim"])
+        for name in ("TScrollbar", "Vertical.TScrollbar"):
+            style.configure(name, background=DARK["surface2"], troughcolor=DARK["bg"],
+                            bordercolor=DARK["bg"], lightcolor=DARK["surface2"],
+                            darkcolor=DARK["surface2"], arrowcolor=DARK["text_dim"],
+                            gripcount=0, relief="flat")
+        style.map("Vertical.TScrollbar", background=[("active", DARK["border"])])
         style.configure("Horizontal.TProgressbar", background=DARK["accent"],
-                        troughcolor=DARK["surface"])
+                        troughcolor=DARK["surface"], bordercolor=DARK["surface"])
         style.configure("TCombobox", fieldbackground=DARK["entry_bg"],
-                        background=DARK["surface"], foreground=DARK["text"],
-                        arrowcolor=DARK["text"])
-
-    def _build_menu(self):
-        menubar = tk.Menu(self, bg=DARK["surface"], fg=DARK["text"],
-                          activebackground=DARK["accent"], activeforeground="#fff",
-                          relief="flat", bd=0)
-        self.config(menu=menubar)
-
-        file_menu = tk.Menu(menubar, tearoff=0, bg=DARK["surface"], fg=DARK["text"],
-                            activebackground=DARK["accent"], activeforeground="#fff")
-        file_menu.add_command(label="Novo projeto", command=self._new_project)
-        file_menu.add_command(label="Abrir projeto…", command=self._open_project)
-        file_menu.add_command(label="Salvar projeto", command=self._save_project, accelerator="Ctrl+S")
-        file_menu.add_command(label="Salvar como…", command=self._save_project_as)
-        file_menu.add_separator()
-        file_menu.add_command(label="Sair", command=self.quit)
-        menubar.add_cascade(label="Arquivo", menu=file_menu)
-
-        render_menu = tk.Menu(menubar, tearoff=0, bg=DARK["surface"], fg=DARK["text"],
-                              activebackground=DARK["accent"], activeforeground="#fff")
-        render_menu.add_command(label="Renderizar vídeo…", command=self._render, accelerator="Ctrl+R")
-        menubar.add_cascade(label="Renderizar", menu=render_menu)
-
-        self.bind_all("<Control-s>", lambda e: self._save_project())
-        self.bind_all("<Control-r>", lambda e: self._render())
+                        background=DARK["surface2"], foreground=DARK["text"],
+                        arrowcolor=DARK["text"], bordercolor=DARK["border"])
+        # readonly comboboxes were drawn gray
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", DARK["entry_bg"])],
+                  foreground=[("readonly", DARK["text"])],
+                  selectbackground=[("readonly", DARK["entry_bg"])],
+                  selectforeground=[("readonly", DARK["text"])])
+        self.option_add("*TCombobox*Listbox.background", DARK["entry_bg"])
+        self.option_add("*TCombobox*Listbox.foreground", DARK["text"])
+        self.option_add("*TCombobox*Listbox.selectBackground", DARK["accent"])
 
     def _build_ui(self):
-        # Title bar area
-        topbar = tk.Frame(self, bg=DARK["surface"], height=56)
-        topbar.pack(fill="x")
-        topbar.pack_propagate(False)
+        # Header
+        header = tk.Frame(self, bg=DARK["surface"], height=60)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        png = os.path.join(_default_assets_dir(), "icon.png")
+        try:
+            self._logo = tk.PhotoImage(master=self, file=png).subsample(8)  # 256 → 32 px
+            tk.Label(header, image=self._logo, bg=DARK["surface"]).pack(side="left", padx=(20, 10))
+        except tk.TclError:
+            self._logo = None
+        tk.Label(header, text="LyricRenderer", bg=DARK["surface"], fg=DARK["text"],
+                 font=(UI_FONT, 15, "bold")).pack(side="left", padx=(0 if self._logo else 20, 0))
 
-        tk.Label(topbar, text="♪  LyricRenderer", bg=DARK["surface"],
-                 fg=DARK["accent"], font=("Segoe UI", 16, "bold")).pack(side="left", padx=20, pady=12)
-
-        StyledButton(topbar, "▶  Renderizar", command=self._render,
-                     style="primary").pack(side="right", padx=16, pady=10)
-        StyledButton(topbar, "💾  Salvar", command=self._save_project,
-                     style="secondary").pack(side="right", pady=10)
-
-        # Main pane
-        paned = tk.PanedWindow(self, orient="horizontal", bg=DARK["bg"],
-                                sashwidth=6, sashpad=0, sashrelief="flat",
-                                handlepad=80, handlesize=8)
-        paned.pack(fill="both", expand=True)
-
-        # Left: settings
-        left_scroll_frame = tk.Frame(paned, bg=DARK["surface"], width=300)
-        paned.add(left_scroll_frame, minsize=240)
-
-        self.settings = SettingsPanel(left_scroll_frame, self.project,
-                                      on_change=self._on_project_change)
-        self.settings.pack(fill="both", expand=True)
-
-        # Right: strophe list
-        right_frame = tk.Frame(paned, bg=DARK["bg"])
-        paned.add(right_frame, minsize=400)
-
-        self.strophe_list = StropheList(right_frame, self.project,
-                                         on_change=self._on_project_change,
-                                         on_auto_lyrics=self._auto_lyrics)
-        self.strophe_list.pack(fill="both", expand=True)
+        StyledButton(header, "⚙  Configurações", command=self._open_settings,
+                     style="ghost").pack(side="right", padx=(4, 16))
+        StyledButton(header, "💾  Salvar", command=self._save_project,
+                     style="ghost").pack(side="right", padx=4)
+        StyledButton(header, "📂  Abrir", command=self._open_project,
+                     style="ghost").pack(side="right", padx=4)
 
         # Status bar
-        self.statusbar = tk.Label(self, text="Pronto.", bg=DARK["surface"],
-                                  fg=DARK["text_dim"], font=("Segoe UI", 8),
-                                  anchor="w", padx=12, pady=4)
+        self.statusbar = tk.Label(self, text="", bg=DARK["surface"], fg=DARK["text_dim"],
+                                  font=(UI_FONT, 8), anchor="w", padx=16, pady=5)
         self.statusbar.pack(fill="x", side="bottom")
 
+        # Body: song panel | strophes
+        body = tk.Frame(self, bg=DARK["bg"])
+        body.pack(fill="both", expand=True, padx=16, pady=16)
+
+        self.song = SongPanel(body, on_pick_audio=self._pick_audio,
+                              on_title_change=self._title_changed,
+                              on_pick_bg=self._pick_bg, on_clear_bg=self._clear_bg,
+                              on_render=self._render)
+        self.song.pack(side="left", fill="y")
+
+        self.strophe_list = StropheList(body, self.project,
+                                        on_change=self._on_project_change,
+                                        on_auto_lyrics=self._auto_lyrics,
+                                        on_select=lambda sid: self._schedule_preview())
+        self.strophe_list.pack(side="left", fill="both", expand=True, padx=(16, 0))
+
+    def _bind_keys(self):
+        for key, fn in (("s", self._save_project), ("r", self._render),
+                        ("o", self._open_project), ("n", self._new_project)):
+            self.bind_all(f"<Control-{key}>", lambda e, f=fn: f())
+            self.bind_all(f"<Control-{key.upper()}>", lambda e, f=fn: f())  # caps lock
+
+    def report_callback_exception(self, exc, val, tb):
+        """Errors in buttons/callbacks: show them (no console with the shortcut)."""
+        text = "".join(traceback.format_exception(exc, val, tb))
+        try:
+            log = os.path.join(os.path.dirname(self.config_file), "erros.log")
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except OSError:
+            log = ""
+        messagebox.showerror("Erro inesperado",
+                             f"{val}\n\nDetalhes salvos em:\n{log}" if log else str(val))
+
+    # ── Song panel ────────────────────────────
+
+    def _sync_song_panel(self):
+        p = self.project
+        self.song.set_audio(p.audio_file)
+        self.song.set_title(p.title)
+        self._sync_background()
+
+    def _sync_background(self):
+        p = self.project
+        bg = p.bg_image if p.bg_image and os.path.isfile(p.bg_image) else ""
+        hint = ("Sem imagem: fundo transparente (.webm)" if p.transparent_bg
+                else "Sem imagem: fundo de cor sólida")
+        self.song.set_background(bg, hint)
+
+    def _pick_audio(self):
+        path = filedialog.askopenfilename(
+            parent=self, title="Escolher áudio da música",
+            initialdir=self.cfg.get("audio_dir") or None,
+            filetypes=[("Áudio", "*.mp3 *.wav *.ogg *.aac *.m4a *.flac"), ("Todos", "*.*")])
+        if path:
+            self.set_audio(path)
+
+    def set_audio(self, path: str):
+        """New song: remember the audio and fill the title from the file name."""
+        self.project.audio_file = path
+        self.song.set_audio(path)
+        self.song.set_title(title_from_filename(path))
+        self.project.title = self.song.title_var.get()
+        self._save_cfg(audio_dir=os.path.dirname(path))
+        self._on_project_change()
+
+    def _title_changed(self, title: str):
+        self.project.title = title
+        self._on_project_change()
+
+    def _pick_bg(self):
+        current = self.project.bg_image
+        path = filedialog.askopenfilename(
+            parent=self, title="Escolher imagem de fundo",
+            initialdir=os.path.dirname(current) if current else None,
+            filetypes=[("Imagem", "*.png *.jpg *.jpeg *.bmp *.webp"), ("Todos", "*.*")])
+        if path:
+            self.set_background(path)
+
+    def set_background(self, path: str):
+        self.project.bg_image = path
+        self._save_cfg(bg_image=path)
+        self._sync_background()
+        self._on_project_change()
+
+    def _clear_bg(self):
+        self.set_background("")
+
+    # ── Settings / preview / status ────────────
+
+    def _open_settings(self):
+        SettingsDialog(self, self.project, on_saved=self._settings_saved)
+
+    def _settings_saved(self):
+        self._save_cfg(**style_of(self.project))
+        self._sync_background()
+        self._on_project_change()
+
     def _on_project_change(self):
-        count = len(self.project.strophes)
+        p = self.project
+        n = len(p.strophes)
+        name = os.path.basename(self._current_file) if self._current_file else "projeto não salvo"
+        end = max((s.end_time for s in p.strophes), default=0)
         self.statusbar.config(
-            text=f"Projeto: {self.project.title}  |  {count} estrofe(s)  |  "
-                 f"{'Salvo' if self._current_file else 'Não salvo'}")
+            text=f"{name}   ·   {n} estrofe{'s' if n != 1 else ''}"
+                 + (f"   ·   legenda até {format_time(end)}" if n else ""))
+        self._schedule_preview()
+
+    def _schedule_preview(self):
+        if self._preview_job:
+            self.after_cancel(self._preview_job)
+        self._preview_job = self.after(120, self._update_preview)
+
+    def _selected_strophe(self) -> Optional[Strophe]:
+        strophes = self.strophe_list.sorted_strophes()
+        sid = self.strophe_list.selected_id
+        return next((s for s in strophes if s.id == sid), strophes[0] if strophes else None)
+
+    def _update_preview(self):
+        self._preview_job = None
+        if not HAS_PIL:
+            return
+        s = self._selected_strophe()
+        strophes = self.strophe_list.sorted_strophes()
+        try:
+            img = render_preview(self.project, s.text if s else "",
+                                 SongPanel.PREVIEW_W, SongPanel.PREVIEW_H)
+        except Exception:
+            img = None
+        if s:
+            idx = strophes.index(s) + 1
+            caption = (f"Estrofe {idx} de {len(strophes)}   ·   "
+                       f"{format_time(s.start_time)} → {format_time(s.end_time)}")
+        else:
+            caption = "As estrofes aparecem aqui. Clique numa estrofe pra ver como fica."
+        self.song.show_preview(img, caption)
 
     # ── File operations ───────────────────────
 
     def _new_project(self):
-        if messagebox.askyesno("Novo projeto", "Descartar projeto atual e criar novo?"):
-            self._load_project(Project(), None)
+        if messagebox.askyesno("Novo projeto", "Descartar o projeto atual e começar outro?"):
+            self._load_project(self._fresh_project(), None)
 
     def _load_project(self, project: Project, path: Optional[str]):
-        """Swap the current project and refresh both panels."""
+        """Swap the current project and refresh everything."""
         self.project = project
         self._current_file = path
-        self.settings.load(project)
+        self._lyrics_audio = project.audio_file if project.strophes else None
         self.strophe_list.project = project
+        self.strophe_list.selected_id = None
         self.strophe_list.refresh()
+        self._sync_song_panel()
         self._on_project_change()
 
     def _open_project(self):
-        path = filedialog.askopenfilename(filetypes=[("LyricRenderer", "*.lyr"),
-                                                     ("JSON", "*.json"), ("Todos", "*.*")])
+        path = filedialog.askopenfilename(parent=self, filetypes=[
+            ("LyricRenderer", "*.lyr"), ("JSON", "*.json"), ("Todos", "*.*")])
         if not path:
             return
         try:
@@ -1984,7 +2307,7 @@ class App(tk.Tk):
 
     def _save_project_as(self):
         path = filedialog.asksaveasfilename(
-            defaultextension=".lyr",
+            parent=self, defaultextension=".lyr",
             filetypes=[("LyricRenderer", "*.lyr"), ("JSON", "*.json")],
             initialfile=f"{safe_filename(self.project.title)}.lyr"
         )
@@ -1993,8 +2316,6 @@ class App(tk.Tk):
             self._do_save(path)
 
     def _do_save(self, path: str):
-        if not self.settings._apply():
-            return
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self.project.to_dict(), f, ensure_ascii=False, indent=2)
@@ -2003,35 +2324,177 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Erro", f"Não foi possível salvar:\n{e}")
 
+    # ── Auto lyrics / render ───────────────────
+
     def _auto_lyrics(self):
-        if not self.settings._apply():
+        p = self.project
+        if not p.audio_file or not os.path.isfile(p.audio_file):
+            messagebox.showinfo("Escolha o áudio", "Escolha o áudio da música primeiro "
+                                                   "(em Música → Áudio).")
             return
 
-        def on_audio_change(path):
-            self.settings.audio_var.set(path)
-            self.project.audio_file = path
-
         def on_done():
+            self._lyrics_audio = p.audio_file
+            self.strophe_list.selected_id = None
             self.strophe_list.refresh()
             self._on_project_change()
 
-        AutoLyricsDialog(self, self.project, on_audio_change=on_audio_change, on_done=on_done)
+        # Strophes left from another song are replaced without asking
+        ask = bool(p.strophes) and self._lyrics_audio in (None, p.audio_file)
+        AutoLyricsDialog(self, p, options=self.cfg,
+                         on_options=lambda o: self._save_cfg(**o),
+                         on_done=on_done, ask_before_replace=ask)
 
     def _render(self):
-        if not self.settings._apply():
-            return
         if not self.project.strophes:
             messagebox.showwarning("Aviso", "Adicione ao menos uma estrofe antes de renderizar.")
             return
-        RenderDialog(self, self.project)
+        out = self._ask_output_path()
+        if out:
+            RenderDialog(self, self.project, out)
+
+    def _ask_output_path(self) -> Optional[str]:
+        transparent = project_is_transparent(self.project)
+        ext = ".webm" if transparent else ".mp4"
+        types = ([("WebM transparente", "*.webm")] if transparent else
+                 [("Vídeo MP4", "*.mp4"), ("WebM", "*.webm")])
+        initial_dir = self.cfg.get("output_dir")
+        if not (initial_dir and os.path.isdir(initial_dir)):
+            videos = os.path.join(os.path.expanduser("~"), "Videos")
+            initial_dir = videos if os.path.isdir(videos) else os.path.expanduser("~")
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Salvar vídeo como", initialdir=initial_dir,
+            initialfile=f"{safe_filename(self.project.title)}{ext}",
+            defaultextension=ext, filetypes=types + [("Todos", "*.*")],
+            confirmoverwrite=False)  # we ask ourselves (also covers .mp4 → .webm)
+        if not path:
+            return None
+        return self._confirm_output(path, transparent)
+
+    def _confirm_output(self, path: str, transparent: bool) -> Optional[str]:
+        """Final output path, after asking before overwriting an existing file."""
+        final = final_output_path(path, transparent)
+        if os.path.exists(final) and not messagebox.askyesno(
+                "Arquivo já existe",
+                f"Já existe um arquivo com esse nome:\n{final}\n\nSubstituir?",
+                icon="warning", default="no", parent=self):
+            return None
+        self._save_cfg(output_dir=os.path.dirname(os.path.abspath(final)))
+        return final
+
+    def check_ffmpeg(self):
+        status = deps.ffmpeg_status()
+        if status != "ok":
+            messagebox.showwarning("FFmpeg", deps.FFMPEG_HELP[status], parent=self)
+
+
+# ─────────────────────────────────────────────
+#  Startup
+# ─────────────────────────────────────────────
+
+def _ensure_std_streams():
+    """pythonw (the shortcut) has no console: some libraries crash writing to it."""
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+
+
+def _set_windows_app_id():
+    """Makes the taskbar show our icon instead of Python's."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("dantas.lyricrenderer")
+        except Exception:
+            pass
+
+
+def _restart():
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
+
+
+def check_dependencies() -> bool:
+    """
+    Offer to install missing packages. Returns True to go on opening the app,
+    False to quit (the app restarts itself after installing).
+    """
+    required = deps.missing(deps.REQUIRED)
+    optional = deps.missing(deps.OPTIONAL)
+    broken_pil = not required and not HAS_PIL
+
+    if not required and not optional and not broken_pil:
+        return True
+
+    root = tk.Tk()
+    root.withdraw()
+    ico = os.path.join(_default_assets_dir(), "icon.ico")
+    if sys.platform == "win32" and os.path.isfile(ico):
+        try:
+            root.iconbitmap(default=ico)
+        except tk.TclError:
+            pass
+
+    if broken_pil:
+        messagebox.showerror("LyricRenderer", "O Pillow está instalado, mas não carregou:\n\n"
+                                              f"{PIL_ERROR}")
+        root.destroy()
+        return False
+
+    lines = [f"• {pkg} — pra {deps.REQUIRED.get(pkg, deps.OPTIONAL.get(pkg))[1]}"
+             + ("" if pkg in deps.REQUIRED else " (opcional)")
+             for pkg in required + optional]
+    if not messagebox.askyesno("Instalar dependências",
+                               "Faltam alguns componentes:\n\n" + "\n".join(lines)
+                               + "\n\nInstalar agora? (precisa de internet)"):
+        root.destroy()
+        if required:
+            return False  # can't run without them
+        return True
+
+    win = tk.Toplevel(root)
+    win.title("Instalando…")
+    win.configure(bg=DARK["bg"], padx=24, pady=20)
+    win.resizable(False, False)
+    tk.Label(win, text="Instalando, pode levar alguns minutos…", bg=DARK["bg"],
+             fg=DARK["text"], font=(UI_FONT, 10)).pack(anchor="w")
+    bar = ttk.Progressbar(win, mode="indeterminate", length=360)
+    bar.pack(pady=(12, 0))
+    bar.start(12)
+    result = {}
+
+    def work():
+        result["ok"], result["out"] = deps.pip_install(required + optional)
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+
+    def wait():
+        if t.is_alive():
+            root.after(200, wait)
+        else:
+            root.quit()
+    root.after(200, wait)
+    root.mainloop()
+    win.destroy()
+
+    if result.get("ok"):
+        messagebox.showinfo("Pronto", "Instalado! O programa vai abrir de novo.")
+        root.destroy()
+        _restart()
+        return False
+    messagebox.showerror("Erro ao instalar",
+                         "Não deu pra instalar:\n\n" + result.get("out", "")[-800:])
+    root.destroy()
+    return not required
 
 
 def main():
-    if not HAS_PIL:
-        print("Pillow não encontrado. Instale com: pip install Pillow")
-        sys.exit(1)
-
+    _ensure_std_streams()
+    _set_windows_app_id()
+    if not check_dependencies():
+        return
     app = App()
+    app.after(800, app.check_ffmpeg)
     app.mainloop()
 
 

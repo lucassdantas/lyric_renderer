@@ -1,65 +1,66 @@
 # Arquitetura do LyricRenderer
 
-App desktop em um arquivo só ([lyric_renderer.py](../lyric_renderer.py)): uma interface Tkinter onde você monta o projeto, e um renderizador que desenha cada frame com Pillow e manda os frames pro FFmpeg por um pipe.
+App desktop em Tkinter. O arquivo principal ([lyric_renderer.py](../lyric_renderer.py)) tem o modelo, o renderizador e a interface; a legenda automática fica em [auto_lyrics.py](../auto_lyrics.py) e a checagem de dependências em [deps.py](../deps.py). Cada quadro do vídeo é desenhado com Pillow e enviado pro FFmpeg por um pipe.
 
 ```
-┌───────────── GUI (Tkinter) ─────────────┐
-│ App                                     │
-│  ├─ SettingsPanel  (form ⇄ Project)     │
-│  ├─ StropheList    (cards das estrofes) │
-│  │   ├─ StropheEditor   (nova/editar)   │
-│  │   └─ PasteBlockDialog (colar bloco)  │
-│  └─ RenderDialog   (thread de render)   │
-└──────────────┬──────────────────────────┘
-               │ Project (dataclass)
-               ▼
+┌──────────────────────────── App (Tk) ─────────────────────────────┐
+│ header: Abrir · Salvar · ⚙ Configurações (SettingsDialog)          │
+│ ┌ SongPanel ─────────────┐  ┌ StropheList ──────────────────────┐ │
+│ │ Áudio / Título / Fundo │  │ 🎤 Gerar (AutoLyricsDialog)        │ │
+│ │ Prévia (render_preview)│  │ 📋 Colar (PasteBlockDialog)        │ │
+│ │ ▶ Renderizar ──────────┼─▶│ + Nova / ✎ (StropheEditor+TimeEntry)│ │
+│ └────────────────────────┘  └───────────────────────────────────┘ │
+└──────────────┬────────────────────────────────────────────────────┘
+               │ Project (dataclass)            RenderDialog (thread)
+               ▼                                      │
         FrameRenderer ──frames RGB/RGBA crus──▶ ffmpeg (stdin) ──▶ .mp4 / .webm
-               ▲                                   ▲
-           Pillow (texto, fundo)             áudio (opcional)
 ```
 
 ## Camadas
 
 ### 1. Modelo de dados
 - **`Strophe`**: `id`, `start_time`, `end_time` (segundos) e `text` (várias linhas).
-- **`Project`**: todas as configurações (título, fontes, cores, fundo, resolução, FPS, fade, áudio) mais a lista de estrofes. `to_dict()`/`from_dict()` fazem a conversão pro arquivo `.lyr`, que é só um JSON. `from_dict` ignora chaves desconhecidas, então arquivos de versões futuras continuam abrindo.
+- **`Project`**: título, áudio, imagem de fundo, estilo (fontes, cores, fundo, resolução, FPS, fade) e estrofes. `to_dict()`/`from_dict()` ⇄ arquivo `.lyr` (JSON). `from_dict` ignora chaves desconhecidas.
 
-### 2. Funções puras (sem Tk, fáceis de testar)
+### 2. Configuração do app (lembrada entre sessões)
+`config.json` em `%APPDATA%\LyricRenderer\` (ou o caminho em `LYRIC_RENDERER_CONFIG`, usado nos testes).
+- Estilo (`STYLE_FIELDS`, salvo pelo ⚙), última imagem de fundo, pastas usadas por último (áudio, saída) e as escolhas da legenda automática (modelo, idioma, ignorar `[ ]`).
+- `load_config`/`save_config` nunca derrubam o app (arquivo ruim = config vazia). `apply_style` ignora valores com tipo errado.
+- Projeto novo = estilo salvo + último fundo. Um `.lyr` aberto usa o estilo dele.
+
+### 3. Funções puras (sem Tk, testadas)
 | Função | O que faz |
 |---|---|
 | `parse_time` / `format_time` | `"01:30.50"` ⇄ `90.5` |
-| `parse_lyrics_block` | Transforma o texto do "Colar Bloco" em `Strophe`s e devolve a lista de erros |
-| `hex_to_rgb`, `safe_filename` | Utilitários |
-| `find_font` | Acha uma fonte por caminho ou nome nas pastas de fontes do sistema |
-| `build_ffmpeg_cmd` | Escolhe codec e container (veja abaixo) |
-| `probe_duration` | Duração do áudio via `ffprobe` |
+| `mask_time_digits` & cia | máscara "estilo banco" do campo de tempo |
+| `title_from_filename` | `03_onde_eu_fui (1).mp3` → `Onde Eu Fui` (tira número de faixa só se tiver zero à esquerda ou `-`/`.` depois, pra não estragar "22 de Outubro") |
+| `parse_lyrics_block` | texto do 📋 Colar → estrofes + erros |
+| `merge_with_next`, `next_strophe_times` | ↓ Juntar; tempos sugeridos pra nova estrofe |
+| `final_output_path`, `project_is_transparent` | transparente sempre vira `.webm` (imagem de fundo desliga a transparência) |
+| `build_ffmpeg_cmd`, `probe_duration` | comando/duração do FFmpeg |
 
-### 3. Renderizador (`FrameRenderer`)
-- `render_frame(t)` monta um frame: base (transparente, cor sólida ou imagem de fundo) + overlay com o título e a estrofe ativa.
-- **Fade**: `_alpha()` usa uma curva *smoothstep*. A duração do fade é `min(fade_duration, 30% da estrofe)`, então estrofes curtas não ficam só em fade.
-- **Título**: aparece do início da primeira estrofe até o fim da última, com fade.
-- **Estrofe ativa**: `active_strophe(t)` pega a primeira estrofe com `start < t < end`.
-- `render_video()` abre o FFmpeg lendo `rawvideo` do stdin, escreve os frames um por um e lê o stderr numa thread separada (senão o pipe trava no Windows). A duração é `max(fim da última estrofe + 1,5s, duração do áudio)`.
+### 4. Renderizador (`FrameRenderer`)
+- `render_frame(t)`: base (transparente, cor ou imagem) + título + estrofe ativa, com fade *smoothstep* (`min(fade, 30% da estrofe)`).
+- `render_video()`: FFmpeg lendo `rawvideo` do stdin; stderr lido numa thread (senão trava no Windows). Duração = `max(fim da letra + 1,5s, duração do áudio)`.
+- Busca de fonte (`_search_font_file`) e imagem de fundo redimensionada (`_load_background`) têm cache: a prévia cria um renderizador a cada mudança.
 
-**Codec por saída** (`build_ffmpeg_cmd`):
-
-| Situação | Vídeo | Áudio |
+| Saída | Vídeo | Áudio |
 |---|---|---|
-| Fundo transparente (qualquer extensão vira `.webm`) | VP9 + alpha (`yuva420p`) | Opus |
+| Transparente (`.webm` forçado) | VP9 + alpha | Opus |
 | `.webm` com fundo | VP9 | Opus |
-| Qualquer outra (ex.: `.mp4`) | H.264 | AAC |
+| `.mp4` | H.264 | AAC |
 
-> Se a imagem de fundo existe, a transparência é desligada automaticamente.
-
-### 4. GUI
-- **`SettingsPanel`**: o formulário da esquerda. `_apply()` copia o form → `Project` (valida os números e devolve `False` se algo estiver inválido). `load(project)` faz o caminho inverso, usado ao abrir ou criar um projeto.
-- **`StropheList`**: lista de cards ordenada por tempo, com os botões de editar, apagar, "↓ Juntar" (`merge_with_next`: junta com a estrofe de baixo, do início da primeira ao fim da segunda), "Nova Estrofe", "Colar Bloco" e "Gerar Legenda".
-- **`RenderDialog`**: roda `render_video` numa thread. Progresso e resultado voltam pra thread do Tk via `after()`. Cancelar (ou fechar a janela) liga uma flag que o loop de frames checa.
-- **`App`**: janela principal, menu, atalhos (Ctrl+S salvar, Ctrl+R renderizar), abrir/salvar `.lyr`.
+### 5. Interface
+- **`SongPanel`** (esquerda): áudio (preenche o título), título, fundo com miniatura, **prévia** 400×225 da estrofe selecionada (`render_preview`: um quadro em tamanho real reduzido; transparente aparece sobre xadrez) e o botão de renderizar.
+- **`StropheList`** (direita): cards ordenados por tempo; clicar seleciona (prévia), duplo clique edita; `✎`, `✕`, `↓ Juntar`.
+- **`SettingsDialog`/`SettingsPanel`**: estilo. Só grava no projeto ao **Salvar** (`_apply`, que valida os números); o App então salva no `config.json`.
+- **`AutoLyricsDialog`**, **`RenderDialog`**: trabalho pesado numa thread (`WorkerMixin`): a thread só coloca callbacks numa `queue.Queue` que a thread do Tk executa (Tk não é thread-safe).
+- **Render**: diálogo nativo de "Salvar como" na última pasta usada, com o título como nome; `_confirm_output` pergunta antes de substituir um arquivo existente (checando o arquivo que vai ser realmente escrito, ex. `.mp4` → `.webm`).
+- **Legenda automática de outra música** é substituída sem perguntar; da mesma música, pergunta (pode ter edição sua).
+- `bind_wheel_scroll`: a roda vai pro widget embaixo do mouse, então escutamos no app inteiro e filtramos pelo caminho do widget.
+- `report_callback_exception`: erro num botão vira janela de erro + `erros.log` na pasta da config (pelo atalho não há terminal).
 
 ## Legenda automática ([auto_lyrics.py](../auto_lyrics.py))
-Botão **🎤 Gerar Legenda** → `AutoLyricsDialog` → `auto_lyrics.generate()` numa thread → as estrofes geradas substituem a lista (pergunta antes se já houver estrofes) pra revisão.
-
 ```
 áudio ──ffmpeg──▶ PCM 16 kHz ──faster-whisper (CPU, int8)──▶ palavras com tempo
                                                               │
@@ -68,30 +69,33 @@ Botão **🎤 Gerar Legenda** → `AutoLyricsDialog` → `auto_lyrics.generate()
                                                               ▼
                                                     TimedStrophe(start, end, text)
 ```
-- **Com letra (alinhar)**: o texto final é exatamente a letra colada (estrofes separadas por linha em branco, tags tipo `[Refrão]` são ignoradas). A letra também vai como *prompt* pro Whisper, o que melhora o reconhecimento. As palavras são normalizadas (sem acento/pontuação) e casadas com `difflib`; cada estrofe vai da primeira à última palavra casada. Estrofe sem nenhuma palavra casada divide o espaço entre as vizinhas.
-- **Sem letra (transcrever)**: linha nova em pausa ≥ 0,6s; linha com mais de 9 palavras é cortada perto do meio, onde a palavra anterior é mais longa (o Whisper "esconde" a pausa dentro da palavra). Estrofe nova em pausa ≥ 1,8s ou a cada 4 linhas.
-- `_finish` dá uma folga de 0,3s antes / 0,4s depois (pro fade não comer sílaba) e garante que as estrofes não se encostem.
-- Modelos `small` (padrão) e `medium`, baixados na primeira vez pro cache do Hugging Face e mantidos em memória entre gerações.
-- **PyAV**: o faster-whisper importa o PyAV só pra decodificar áudio. Como o FFmpeg já faz isso (e o Smart App Control do Windows pode bloquear as DLLs do PyAV), `_import_whisper_model` usa um módulo vazio no lugar se o import falhar. `.wav` é lido em Python puro se o FFmpeg não rodar.
-- A comunicação da thread com a interface é por uma `queue.Queue` lida pela thread principal (a thread nunca mexe no Tk).
+- **Com letra**: o texto final é a letra colada. `split_lyrics`: linha em branco separa estrofes; com "ignorar `[ ]`", tudo entre colchetes some e uma linha que era só tag (`[refrão]`) também separa estrofe. Parênteses ficam (o Suno canta). Se a opção estiver desligada, as tags aparecem no texto mas nunca são casadas com o áudio. O *prompt* do Whisper é sempre a letra sem tags. Palavras normalizadas (sem acento/pontuação) e casadas com `difflib`; estrofe sem nenhuma palavra casada divide o espaço entre as vizinhas.
+- **Sem letra**: linha nova em pausa ≥ 0,6s; linha com > 9 palavras cortada perto do meio onde a palavra anterior é mais longa (o Whisper "esconde" a pausa dentro da palavra); estrofe nova em pausa ≥ 1,8s ou a cada 4 linhas.
+- `_finish`: folga de 0,3s antes / 0,4s depois (o fade não come sílaba) e estrofes sem encostar.
+- Modelos `small` (padrão) e `medium`, baixados na primeira vez pro cache do Hugging Face (`is_downloaded` checa) e mantidos em memória.
+- **PyAV**: o faster-whisper importa só pra decodificar áudio, o que fazemos com o FFmpeg. Se o import falhar (ex.: DLL bloqueada pelo Smart App Control), `_import_whisper_model` usa um módulo vazio no lugar. `.wav` é lido em Python puro se o FFmpeg não rodar.
 
-## Launcher (`run.py`)
-Instala o Pillow e o faster-whisper se estiverem faltando (checa com `find_spec`, sem importar), avisa se não achar o FFmpeg e abre o app.
+## Inicialização (`main`)
+1. `_ensure_std_streams`: com `pythonw` (atalho) não existe console; algumas bibliotecas quebram ao escrever nele.
+2. `_set_windows_app_id`: barra de tarefas mostra o ícone do app, não o do Python.
+3. `check_dependencies` ([deps.py](../deps.py)): pacotes checados com `find_spec` (sem importar). Faltando algo, pergunta, instala com pip numa thread e reabre o app. Pillow é obrigatório; faster-whisper é opcional (só a legenda automática).
+4. Abre o `App` e, logo depois, `check_ffmpeg` avisa se o FFmpeg está faltando ou bloqueado.
+
+## Arquivos de apoio
+- `assets/icon.png`, `assets/icon.ico`: gerados por `tools/make_icon.py`.
+- `tools/create_shortcut.py`: atalho na Área de Trabalho apontando pro `pythonw.exe` + `lyric_renderer.py`, com o ícone.
 
 ## Testes
 ```bash
 python -m unittest discover -s tests -t .
 ```
-- `test_core.py`: tempo, parser do bloco, serialização do projeto
-- `test_renderer.py`: curva de fade, estrofe ativa, frames em memória, comando do FFmpeg
-- `test_render_ffmpeg.py`: renders reais pequenos (160×90), pulado se não tiver FFmpeg
-- `test_gui.py`: abrir/novo projeto, toggle de fundo, validação (janela escondida, diálogos simulados)
-- `test_auto_lyrics.py`: agrupamento, alinhamento, leitura de WAV. O teste com o Whisper real é lento e só roda com `LYRIC_SLOW_TESTS=1 LYRIC_TEST_AUDIO=musica.wav [LYRIC_TEST_LYRICS=letra.txt]`
-- `test_run.py`: launcher
+- `test_core.py`: tempo, máscara, parser, juntar, título pelo nome do arquivo, config, serialização
+- `test_renderer.py`: fade, estrofe ativa, quadros, comando do FFmpeg
+- `test_render_ffmpeg.py`: renders reais pequenos (pulado se o FFmpeg não roda)
+- `test_auto_lyrics.py`: colchetes, agrupamento, alinhamento, leitura de WAV. Whisper real só com `LYRIC_SLOW_TESTS=1 LYRIC_TEST_AUDIO=musica.wav [LYRIC_TEST_LYRICS=letra.txt]`
+- `test_gui.py`: tela principal, configurações salvas, prévia, render (aviso de substituir), legenda automática, rolagem, checagem de dependências (janelas escondidas, diálogos simulados)
+- `test_deps.py`: pacotes faltando, pip, estados do FFmpeg
 
 ## Limitações conhecidas
-- Cada frame é desenhado do zero em Python, então o render é mais lento que o tempo real em 1080p. VP9 com alpha é a opção mais lenta.
+- Cada quadro é desenhado em Python: em 1080p o render é mais lento que o tempo real (VP9 com alpha é o mais lento).
 - Estrofes sobrepostas: só a que começa primeiro aparece.
-
-## Rolagem com o mouse
-O evento da roda vai pro widget que está embaixo do ponteiro (um label, um botão do card), não pro canvas. Por isso `bind_wheel_scroll(canvas)` escuta a roda no app inteiro (`bind_all`) e só rola se o widget do evento estiver dentro do canvas (pelo caminho do widget no Tk). É usado na lista de estrofes e no painel de configurações.

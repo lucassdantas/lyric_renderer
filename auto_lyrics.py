@@ -226,7 +226,12 @@ def transcribe_words(audio, model_size: str = DEFAULT_MODEL, language: Optional[
 #  Pure helpers
 # ─────────────────────────────────────────────
 
-_SECTION_TAG = re.compile(r"^\s*[\[(][^\])]*[\])]\s*$")  # [Refrão], (Verse 2)…
+_TAG = re.compile(r"\[[^\]]*\]")  # [Refrão], [pré-refrão final]… (Suno meta tags)
+
+
+def strip_tags(line: str) -> str:
+    """Remove everything inside [ ] — like Suno, which doesn't sing it."""
+    return re.sub(r"\s{2,}", " ", _TAG.sub("", line)).strip()
 
 
 def normalize_word(word: str) -> str:
@@ -236,15 +241,28 @@ def normalize_word(word: str) -> str:
     return re.sub(r"[^a-z0-9]", "", w)
 
 
-def split_lyrics(lyrics: str) -> List[List[str]]:
-    """Lyrics text → strophes → lines. Blank lines separate strophes and
-    section tags like [Refrão] are dropped."""
+def split_lyrics(lyrics: str, ignore_tags: bool = True) -> List[List[str]]:
+    """
+    Lyrics text → strophes → lines. Blank lines separate strophes.
+    With ignore_tags, whatever is inside [ ] is removed, and a line that was
+    only a tag (e.g. "[refrão]") also starts a new strophe.
+    """
     strophes = []
     for block in re.split(r"\n\s*\n", lyrics.strip()):
-        lines = [l.strip() for l in block.split("\n")
-                 if l.strip() and not _SECTION_TAG.match(l)]
-        if lines:
-            strophes.append(lines)
+        current = []
+        for raw in block.split("\n"):
+            line = raw.strip()
+            if ignore_tags and _TAG.search(line):
+                line = strip_tags(line)
+                if not line:  # tag-only line: section boundary
+                    if current:
+                        strophes.append(current)
+                    current = []
+                    continue
+            if line:
+                current.append(line)
+        if current:
+            strophes.append(current)
     return strophes
 
 
@@ -313,19 +331,21 @@ def _line_text(line: List[Word]) -> str:
 
 
 def align_lyrics(lyrics: str, words: List[Word],
-                 audio_end: Optional[float] = None) -> List[TimedStrophe]:
+                 audio_end: Optional[float] = None,
+                 ignore_tags: bool = True) -> List[TimedStrophe]:
     """
     Align mode: match the given lyrics to the transcribed words and time each
     strophe by its first and last matched word. Strophes with no match get the
-    gap between their neighbours.
+    gap between their neighbours. With ignore_tags=False the [tags] stay in the
+    text, but they're never matched against the audio (they aren't sung).
     """
-    strophes = split_lyrics(lyrics)
+    strophes = split_lyrics(lyrics, ignore_tags)
     if not strophes:
         return []
 
     lyric_tokens, owner = [], []  # normalized lyric words, strophe index of each
     for i, lines in enumerate(strophes):
-        for w in " ".join(lines).split():
+        for w in strip_tags(" ".join(lines)).split():
             n = normalize_word(w)
             if n:
                 lyric_tokens.append(n)
@@ -361,14 +381,16 @@ def align_lyrics(lyrics: str, words: List[Word],
 def generate(audio_path: str, lyrics: str = "", model_size: str = DEFAULT_MODEL,
              language: Optional[str] = "pt",
              progress: Optional[Callable[[float], None]] = None,
-             cancel: Optional[Callable[[], bool]] = None) -> List[TimedStrophe]:
+             cancel: Optional[Callable[[], bool]] = None,
+             ignore_tags: bool = True) -> List[TimedStrophe]:
     """Full pipeline: audio file (+ optional lyrics) → timed strophes."""
     audio = load_audio(audio_path)
     audio_end = len(audio) / SAMPLE_RATE
-    prompt = " ".join(" ".join(lines) for lines in split_lyrics(lyrics)) if lyrics.strip() else ""
+    # the hint for Whisper is only what is actually sung: never the [tags]
+    prompt = " ".join(" ".join(lines) for lines in split_lyrics(lyrics, True)) if lyrics.strip() else ""
     words = transcribe_words(audio, model_size, language, prompt, progress, cancel)
     if lyrics.strip():
-        return align_lyrics(lyrics, words, audio_end)
+        return align_lyrics(lyrics, words, audio_end, ignore_tags)
     if not words:
         raise AutoLyricsError("Nenhuma voz foi reconhecida no áudio.")
     return group_lines(words, audio_end)
