@@ -32,6 +32,20 @@ Pra criar o atalho de novo (ex.: mudou a pasta de lugar): `python tools/create_s
 
 Pra próxima música: troque o áudio (o título acompanha), gere a legenda, confira e renderize.
 
+### Lote (várias músicas de uma vez)
+
+Aba **📚 Lote** no topo. O lote fica salvo sozinho: pode fechar o app e continuar depois.
+
+1. **+ Adicionar áudios** → escolha todos de uma vez. O título vem do nome do arquivo e, se tiver um `.txt` com o mesmo nome do áudio na pasta, a letra já vem junto.
+2. Clique em cada música e **cole a letra** (ou deixe vazio pra IA escrever). Dá pra corrigir o título ali também.
+3. Embaixo, **Pra todas**: o fundo (o mesmo da tela de uma música) e a **pasta de saída**.
+4. Escolha como seguir:
+   - **🎤 Gerar legendas** → gera todas, uma depois da outra. Depois clique em **✎ Revisar legenda** (ou duplo clique na música): ela abre no editor normal, com prévia, ✎, ↓ Juntar etc. Na barra de cima, **✓ Revisada, próxima →** já abre a próxima que falta. No fim, **▶ Renderizar todas**.
+   - **⚡ Gerar e renderizar direto** → faz legenda + vídeo de cada música sem parar, sem revisão.
+5. Cada vídeo sai na pasta com o título como nome. Se já existir, ele pergunta uma vez: substituir, pular esses ou cancelar.
+
+A lista mostra a situação de cada música (sem legenda, legenda pronta, revisada, vídeo pronto, erro). Uma música com erro não para as outras. **⏹ Parar** interrompe depois do passo atual. Por música: **↻ Gerar de novo**, **▶ Renderizar esta**, **📂 Abrir pasta**. `Ctrl+R` na tela do lote = Renderizar todas. O lote faz só vídeos 16:9; shorts continuam pela aba 🎵 Uma música.
+
 ### Short (9:16)
 
 1. Clique em **📱 Short** no topo da coluna da esquerda.

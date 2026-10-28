@@ -23,6 +23,7 @@ from typing import List, Optional
 import colorsys
 
 import auto_lyrics
+import batch
 import deps
 
 try:
@@ -2650,7 +2651,374 @@ def render_preview(project: Project, text: str, w: int, h: int):
     return frame.convert("RGB")
 
 
-class App(tk.Tk):
+def batch_project(item: "batch.BatchItem", cfg: dict, bg_image: str = "") -> Project:
+    """The project of one song of the batch: saved style + shared background +
+    its own audio, title and strophes. Batch videos are always 16:9."""
+    p = Project(title=item.title, audio_file=item.audio_file)
+    apply_style(p, cfg)
+    if bg_image and os.path.isfile(bg_image):
+        p.bg_image = bg_image
+    p.strophes = [Strophe(**{k: v for k, v in d.items() if k in Strophe.__dataclass_fields__})
+                  for d in item.strophes]
+    return p
+
+
+STATUS_COLORS = {
+    batch.PENDING: DARK["text_dim"],
+    batch.LYRICS: DARK["warn"],
+    batch.REVIEWED: "#6fa8ff",
+    batch.DONE: DARK["success"],
+    batch.ERROR: DARK["accent"],
+    batch.GENERATING: DARK["text"],
+    batch.RENDERING: DARK["text"],
+}
+
+
+class BatchView(tk.Frame):
+    """
+    📚 Lote: many songs at once. Left: the songs (status of each), the shared
+    background and the output folder. Right: title and lyrics of the selected
+    song. Bottom: generate / render everything, with progress.
+    All the work is done by the App (on_* callbacks); this is only the screen.
+    """
+
+    def __init__(self, parent, app):
+        super().__init__(parent, bg=DARK["bg"])
+        self.app = app
+        self.selected: Optional[int] = None
+        self._rows = []
+        self._loading = False  # filling the form: don't treat it as user edits
+
+        # ── Bottom action bar ──────────────────────────
+        bar = tk.Frame(self, bg=DARK["surface"], padx=16, pady=12)
+        bar.pack(side="bottom", fill="x", pady=(12, 0))
+        top = tk.Frame(bar, bg=DARK["surface"])
+        top.pack(fill="x")
+        self.gen_btn = StyledButton(top, "🎤  Gerar legendas", command=app.batch_generate,
+                                    style="secondary")
+        self.gen_btn.pack(side="left")
+        self.render_btn = StyledButton(top, "▶  Renderizar todas", command=app.batch_render)
+        self.render_btn.pack(side="left", padx=(8, 0))
+        self.direct_btn = StyledButton(top, "⚡  Gerar e renderizar direto",
+                                       command=app.batch_direct, style="secondary")
+        self.direct_btn.pack(side="left", padx=(8, 0))
+        self.stop_btn = StyledButton(top, "⏹  Parar", command=app.batch_stop, style="danger")
+
+        opts = tk.Frame(top, bg=DARK["surface"])
+        opts.pack(side="right")
+        tk.Label(opts, text="Modelo", bg=DARK["surface"], fg=DARK["text_dim"],
+                 font=(UI_FONT, 9)).pack(side="left", padx=(0, 6))
+        model = app.cfg.get("whisper_model", auto_lyrics.DEFAULT_MODEL)
+        self.model_var = tk.StringVar(value=auto_lyrics.MODELS.get(
+            model, auto_lyrics.MODELS[auto_lyrics.DEFAULT_MODEL]))
+        ttk.Combobox(opts, textvariable=self.model_var, values=list(auto_lyrics.MODELS.values()),
+                     state="readonly", width=15).pack(side="left")
+        tk.Label(opts, text="Idioma", bg=DARK["surface"], fg=DARK["text_dim"],
+                 font=(UI_FONT, 9)).pack(side="left", padx=(12, 6))
+        lang = app.cfg.get("language", "Português")
+        self.lang_var = tk.StringVar(value=lang if lang in AutoLyricsDialog.LANGUAGES else "Português")
+        ttk.Combobox(opts, textvariable=self.lang_var, values=list(AutoLyricsDialog.LANGUAGES),
+                     state="readonly", width=11).pack(side="left")
+
+        prog = tk.Frame(bar, bg=DARK["surface"])
+        prog.pack(fill="x", pady=(10, 0))
+        self.progress_label = tk.Label(prog, text="", bg=DARK["surface"], fg=DARK["text_dim"],
+                                       font=(UI_FONT, 9), anchor="w")
+        self.progress_label.pack(side="left")
+        self.progress_bar = ttk.Progressbar(prog, mode="determinate", length=320)
+        self.progress_bar.pack(side="right")
+
+        # ── Left column: songs + shared settings ───────
+        left = tk.Frame(self, bg=DARK["bg"], width=440)
+        left.pack(side="left", fill="y")
+        left.pack_propagate(False)
+
+        shared = tk.Frame(left, bg=DARK["surface"], padx=16, pady=12)
+        shared.pack(side="bottom", fill="x", pady=(12, 0))
+        section_title(shared, "Pra todas", DARK["surface"]).pack(anchor="w", pady=(0, 6))
+        r = tk.Frame(shared, bg=DARK["surface"])
+        r.pack(fill="x", pady=3)
+        tk.Label(r, text="Fundo", bg=DARK["surface"], fg=DARK["text_dim"], font=(UI_FONT, 9),
+                 width=6, anchor="w").pack(side="left")
+        StyledButton(r, "Escolher…", command=app._pick_bg, style="secondary",
+                     padx=10, pady=3, font=(UI_FONT, 9)).pack(side="right")
+        self.bg_label = tk.Label(r, text="", bg=DARK["surface"], fg=DARK["text"],
+                                 font=(UI_FONT, 9), anchor="w")
+        self.bg_label.pack(side="left", fill="x", expand=True)
+        r = tk.Frame(shared, bg=DARK["surface"])
+        r.pack(fill="x", pady=3)
+        tk.Label(r, text="Saída", bg=DARK["surface"], fg=DARK["text_dim"], font=(UI_FONT, 9),
+                 width=6, anchor="w").pack(side="left")
+        StyledButton(r, "Escolher…", command=app.batch_pick_folder, style="secondary",
+                     padx=10, pady=3, font=(UI_FONT, 9)).pack(side="right")
+        self.folder_label = tk.Label(r, text="", bg=DARK["surface"], fg=DARK["text"],
+                                     font=(UI_FONT, 9), anchor="w")
+        self.folder_label.pack(side="left", fill="x", expand=True)
+        self.ignore_tags_var = tk.BooleanVar(value=app.cfg.get("ignore_tags", True))
+        tk.Checkbutton(shared, text="Ignorar o que estiver entre [ ] nas letras",
+                       variable=self.ignore_tags_var, bg=DARK["surface"], fg=DARK["text"],
+                       activebackground=DARK["surface"], activeforeground=DARK["text"],
+                       selectcolor=DARK["entry_bg"], font=(UI_FONT, 9),
+                       command=lambda: app._save_cfg(ignore_tags=self.ignore_tags_var.get())
+                       ).pack(anchor="w", pady=(4, 0))
+
+        hdr = tk.Frame(left, bg=DARK["bg"])
+        hdr.pack(fill="x", pady=(0, 8))
+        section_title(hdr, "Músicas", DARK["bg"]).pack(side="left")
+        self.count_label = tk.Label(hdr, text="", bg=DARK["bg"], fg=DARK["text_dim"],
+                                    font=(UI_FONT, 9))
+        self.count_label.pack(side="left", padx=(8, 0))
+        StyledButton(hdr, "+ Adicionar áudios", command=app.batch_add, style="primary",
+                     padx=10, pady=4, font=(UI_FONT, 9, "bold")).pack(side="right")
+        self.clear_btn = StyledButton(hdr, "Limpar", command=app.batch_clear, style="ghost",
+                                      padx=8, pady=4, font=(UI_FONT, 9))
+        self.clear_btn.pack(side="right", padx=(0, 4))
+
+        lst = tk.Frame(left, bg=DARK["bg"])
+        lst.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(lst, bg=DARK["bg"], highlightthickness=0)
+        sb = ttk.Scrollbar(lst, orient="vertical", command=self.canvas.yview)
+        self.rows_frame = tk.Frame(self.canvas, bg=DARK["bg"])
+        self.rows_frame.bind("<Configure>",
+                             lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        win = self.canvas.create_window((0, 0), window=self.rows_frame, anchor="nw")
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(win, width=e.width))
+        self.canvas.configure(yscrollcommand=sb.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        bind_wheel_scroll(self.canvas)
+
+        # ── Right column: the selected song ────────────
+        self.detail = tk.Frame(self, bg=DARK["surface"], padx=18, pady=14)
+        self.detail.pack(side="left", fill="both", expand=True, padx=(16, 0))
+        # everything about the selected song; swapped for empty_label when
+        # the batch is empty
+        self.form = right = tk.Frame(self.detail, bg=DARK["surface"])
+        right.pack(fill="both", expand=True)
+
+        r = tk.Frame(right, bg=DARK["surface"])
+        r.pack(fill="x")
+        tk.Label(r, text="Título", bg=DARK["surface"], fg=DARK["text_dim"], font=(UI_FONT, 9),
+                 width=7, anchor="w").pack(side="left")
+        self.title_var = tk.StringVar()
+        self.title_var.trace_add("write", lambda *_: self._edited())
+        styled_entry(r, self.title_var, font_size=11).pack(side="left", fill="x", expand=True)
+        self.audio_label = tk.Label(right, text="", bg=DARK["surface"], fg=DARK["text_dim"],
+                                    font=(UI_FONT, 9), anchor="w")
+        self.audio_label.pack(fill="x", pady=(6, 0))
+
+        lh = tk.Frame(right, bg=DARK["surface"])
+        lh.pack(fill="x", pady=(14, 4))
+        tk.Label(lh, text="Letra", bg=DARK["surface"], fg=DARK["text"],
+                 font=(UI_FONT, 10, "bold")).pack(side="left")
+        tk.Label(lh, text="  estrofes separadas por linha em branco · vazio = a IA escreve sozinha",
+                 bg=DARK["surface"], fg=DARK["text_dim"], font=(UI_FONT, 8)).pack(side="left")
+        tf = tk.Frame(right, bg=DARK["border"], padx=1, pady=1)
+        tf.pack(fill="both", expand=True)
+        self.lyrics_text = tk.Text(tf, bg=DARK["entry_bg"], fg=DARK["text"],
+                                   insertbackground=DARK["text"], font=(UI_FONT, 10),
+                                   relief="flat", bd=8, wrap="word", undo=True)
+        self.lyrics_text.pack(fill="both", expand=True)
+        self.lyrics_text.bind("<<Modified>>", self._lyrics_modified)
+
+        self.state_label = tk.Label(right, text="", bg=DARK["surface"], fg=DARK["text_dim"],
+                                    font=(UI_FONT, 9), anchor="w", justify="left", wraplength=560)
+        self.state_label.pack(fill="x", pady=(10, 0))
+        acts = tk.Frame(right, bg=DARK["surface"])
+        acts.pack(fill="x", pady=(8, 0))
+        self.review_btn = StyledButton(acts, "✎  Revisar legenda", command=lambda: app.open_review(self.selected),
+                                       style="primary", padx=12, pady=5, font=(UI_FONT, 9, "bold"))
+        self.review_btn.pack(side="left")
+        self.regen_btn = StyledButton(acts, "↻  Gerar de novo", command=lambda: app.batch_regenerate(self.selected),
+                                      style="secondary", padx=12, pady=5, font=(UI_FONT, 9))
+        self.regen_btn.pack(side="left", padx=(6, 0))
+        self.rerender_btn = StyledButton(acts, "▶  Renderizar esta", command=lambda: app.batch_render_one(self.selected),
+                                         style="secondary", padx=12, pady=5, font=(UI_FONT, 9))
+        self.rerender_btn.pack(side="left", padx=(6, 0))
+        self.open_btn = StyledButton(acts, "📂  Abrir pasta", style="ghost", padx=10, pady=5,
+                                     font=(UI_FONT, 9), command=self._open_output)
+        self.remove_btn = StyledButton(acts, "Remover do lote", command=lambda: app.batch_remove(self.selected),
+                                       style="ghost", padx=10, pady=5, font=(UI_FONT, 9))
+        self.remove_btn.pack(side="right")
+
+        self.empty_label = tk.Label(self.detail, text="Adicione os áudios das músicas\n"
+                                                      "com  + Adicionar áudios.\n\n"
+                                                      "Dá pra escolher vários de uma vez. Se tiver um .txt com o\n"
+                                                      "mesmo nome do áudio na pasta, a letra já vem junto.",
+                                    bg=DARK["surface"], fg=DARK["text_dim"], font=(UI_FONT, 11),
+                                    justify="center")
+
+    # ── Refresh ─────────────────────────────────────────
+
+    @property
+    def items(self) -> List[batch.BatchItem]:
+        return self.app.batch_items
+
+    def refresh(self):
+        """Rebuild the song list and the selected song's panel."""
+        for w in self.rows_frame.winfo_children():
+            w.destroy()
+        self._rows = []
+        n = len(self.items)
+        done = sum(1 for i in self.items if i.status == batch.DONE)
+        self.count_label.config(text=f"· {n}" + (f"   ({done} prontas)" if done else "") if n else "")
+        if self.selected is not None and self.selected >= n:
+            self.selected = n - 1 if n else None
+        if self.selected is None and n:
+            self.selected = 0
+        for idx, item in enumerate(self.items):
+            self._rows.append(self._row(idx, item))
+        if not n:
+            tk.Label(self.rows_frame, text="Nenhuma música ainda.", bg=DARK["bg"],
+                     fg=DARK["text_dim"], font=(UI_FONT, 10)).pack(pady=30)
+        self.refresh_shared()
+        self._show_selected()
+
+    def refresh_shared(self):
+        bg = self.app.project.bg_image
+        self.bg_label.config(text=os.path.basename(bg) if bg else "sem imagem (cor sólida)",
+                             fg=DARK["text"] if bg else DARK["text_dim"])
+        folder = self.app.batch_folder
+        self.folder_label.config(text=folder or "escolha a pasta dos vídeos",
+                                 fg=DARK["text"] if folder else DARK["accent"])
+
+    def _row(self, idx: int, item: batch.BatchItem):
+        sel = idx == self.selected
+        row = tk.Frame(self.rows_frame, bg=DARK["surface"], highlightthickness=2,
+                       highlightbackground=DARK["selected"] if sel else DARK["surface"],
+                       cursor="hand2", padx=12, pady=8)
+        row.pack(fill="x", padx=(0, 4), pady=3)
+        top = tk.Frame(row, bg=DARK["surface"])
+        top.pack(fill="x")
+        tk.Label(top, text=item.title or "(sem título)", bg=DARK["surface"], fg=DARK["text"],
+                 font=(UI_FONT, 10, "bold"), anchor="w").pack(side="left")
+        status = tk.Label(top, text="● " + batch.STATUS_LABELS[item.status], bg=DARK["surface"],
+                          fg=STATUS_COLORS[item.status], font=(UI_FONT, 9))
+        status.pack(side="right")
+        sub = os.path.basename(item.audio_file)
+        sub += "   ·   " + ("letra colada" if item.lyrics.strip() else "sem letra (a IA escreve)")
+        tk.Label(row, text=sub, bg=DARK["surface"], fg=DARK["text_dim"], font=(UI_FONT, 8),
+                 anchor="w").pack(fill="x")
+
+        def bind(w):
+            w.bind("<Button-1>", lambda e, i=idx: self.select(i))
+            w.bind("<Double-Button-1>", lambda e, i=idx: self.app.open_review(i))
+            for c in w.winfo_children():
+                bind(c)
+        bind(row)
+        row.status_label = status
+        return row
+
+    def update_row(self, idx: int):
+        """Cheap update of one song's status while the batch runs."""
+        if 0 <= idx < len(self._rows) and idx < len(self.items):
+            st = self.items[idx].status
+            self._rows[idx].status_label.config(text="● " + batch.STATUS_LABELS[st],
+                                                fg=STATUS_COLORS[st])
+        if idx == self.selected:
+            self._show_state()
+
+    def select(self, idx: int):
+        self.selected = idx
+        for i, row in enumerate(self._rows):
+            row.config(highlightbackground=DARK["selected"] if i == idx else DARK["surface"])
+        self._show_selected()
+
+    def _show_selected(self):
+        item = self.items[self.selected] if self.selected is not None else None
+        if item is None:
+            self.form.pack_forget()
+            self.empty_label.pack(expand=True)
+            return
+        self.empty_label.pack_forget()
+        self.form.pack(fill="both", expand=True)
+        self._loading = True
+        self.title_var.set(item.title)
+        self.audio_label.config(text=f"Áudio: {item.audio_file}")
+        self.lyrics_text.delete("1.0", "end")
+        self.lyrics_text.insert("1.0", item.lyrics)
+        self.lyrics_text.edit_modified(False)
+        self.lyrics_text.edit_reset()
+        self._loading = False
+        self._show_state()
+
+    def _show_state(self):
+        if self.selected is None:
+            return
+        item = self.items[self.selected]
+        st = item.status
+        n = len(item.strophes)
+        text = {
+            batch.PENDING: "Ainda sem legenda. Use  🎤 Gerar legendas  embaixo.",
+            batch.LYRICS: f"Legenda pronta ({n} estrofes). Dá pra conferir em  ✎ Revisar legenda.",
+            batch.REVIEWED: f"Revisada ✓ ({n} estrofes). Pronta pra renderizar.",
+            batch.DONE: f"Vídeo pronto: {item.output_file}",
+            batch.ERROR: f"Erro: {item.error}",
+            batch.GENERATING: "Gerando a legenda…",
+            batch.RENDERING: "Renderizando o vídeo…",
+        }[st]
+        self.state_label.config(text=text, fg=STATUS_COLORS[st] if st != batch.PENDING else DARK["text_dim"])
+        busy = self.app.batch_running
+        has = bool(item.strophes)
+        self.review_btn.config(state="normal" if has and not item.busy else "disabled")
+        self.regen_btn.config(state="disabled" if busy else "normal")
+        self.rerender_btn.config(state="normal" if has and not busy else "disabled")
+        self.remove_btn.config(state="disabled" if item.busy else "normal")
+        if item.rendered and item.output_file:
+            self.open_btn.pack(side="left", padx=(6, 0))
+        else:
+            self.open_btn.pack_forget()
+
+    # ── Edits ───────────────────────────────────────────
+
+    def _edited(self):
+        if self._loading or self.selected is None:
+            return
+        item = self.items[self.selected]
+        item.title = self.title_var.get()
+        if self._rows:
+            title_label = self._rows[self.selected].winfo_children()[0].winfo_children()[0]
+            title_label.config(text=item.title or "(sem título)")
+        self.app.batch_changed()
+
+    def _lyrics_modified(self, _e=None):
+        if not self.lyrics_text.edit_modified():
+            return
+        self.lyrics_text.edit_modified(False)
+        if self._loading or self.selected is None:
+            return
+        self.items[self.selected].lyrics = self.lyrics_text.get("1.0", "end-1c")
+        self.app.batch_changed()
+
+    def _open_output(self):
+        item = self.items[self.selected]
+        if item.output_file:
+            open_folder(os.path.dirname(os.path.abspath(item.output_file)))
+
+    # ── Running state ───────────────────────────────────
+
+    def set_running(self, running: bool):
+        for b in (self.gen_btn, self.render_btn, self.direct_btn, self.clear_btn):
+            b.config(state="disabled" if running else "normal")
+        if running:
+            self.stop_btn.pack(side="left", padx=(8, 0))
+        else:
+            self.stop_btn.pack_forget()
+            self.progress_bar["value"] = 0
+        self._show_state()
+
+    def show_progress(self, text: str, value: float):
+        self.progress_label.config(text=text)
+        self.progress_bar["value"] = max(0, min(100, value * 100))
+
+    def options(self) -> dict:
+        label = self.model_var.get()
+        model = next((k for k, v in auto_lyrics.MODELS.items() if v == label), auto_lyrics.DEFAULT_MODEL)
+        return {"model": model, "language": AutoLyricsDialog.LANGUAGES.get(self.lang_var.get(), "pt"),
+                "language_label": self.lang_var.get(), "ignore_tags": self.ignore_tags_var.get()}
+
+
+class App(WorkerMixin, tk.Tk):
     def __init__(self, config_file: Optional[str] = None):
         super().__init__()
         self.title("LyricRenderer")
@@ -2668,12 +3036,24 @@ class App(tk.Tk):
         self._player = None         # ffplay process of "▶ Ouvir"
         self._bg_sizes = {}
 
+        # Batch (📚 Lote): autosaved next to the config, so it survives closing the app
+        self.batch_file = os.path.join(os.path.dirname(self.config_file), "lote.json")
+        self.batch_items, self.batch_folder = batch.load_batch(self.batch_file)
+        if not self.batch_folder and os.path.isdir(self.cfg.get("output_dir") or ""):
+            self.batch_folder = self.cfg["output_dir"]
+        self.batch_runner: Optional[batch.BatchRunner] = None
+        self._batch_order: List[int] = []
+        self._batch_save_job = None
+        self._reviewing: Optional[int] = None   # batch song open in the editor
+        self._single_stash = None               # the single-song project, put back after
+        self.view = "single"
+
         self._set_icon()
         self._setup_styles()
         self._build_ui()
         self._bind_keys()
         self._sync_song_panel()
-        self._on_project_change()
+        self.show_view("single")
 
     # ── Setup ─────────────────────────────────
 
@@ -2742,6 +3122,17 @@ class App(tk.Tk):
         tk.Label(header, text="LyricRenderer", bg=DARK["surface"], fg=DARK["text"],
                  font=(UI_FONT, 15, "bold")).pack(side="left", padx=(0 if self._logo else 20, 0))
 
+        # One song / batch
+        tabs = tk.Frame(header, bg=DARK["surface"])
+        tabs.pack(side="left", padx=(32, 0))
+        self.tab_btns = {}
+        for key, text in (("single", "🎵  Uma música"), ("batch", "📚  Lote")):
+            b = tk.Button(tabs, text=text, relief="flat", bd=0, cursor="hand2", padx=14, pady=6,
+                          font=(UI_FONT, 10, "bold"), highlightthickness=0,
+                          command=lambda k=key: self.show_view(k))
+            b.pack(side="left", padx=2)
+            self.tab_btns[key] = b
+
         StyledButton(header, "⚙  Configurações", command=self._open_settings,
                      style="ghost").pack(side="right", padx=(4, 16))
         StyledButton(header, "💾  Salvar", command=self._save_project,
@@ -2754,8 +3145,23 @@ class App(tk.Tk):
                                   font=(UI_FONT, 8), anchor="w", padx=16, pady=5)
         self.statusbar.pack(fill="x", side="bottom")
 
+        # Shown while a batch song is being reviewed in the editor
+        self.review_bar = tk.Frame(self, bg=DARK["surface2"], padx=16, pady=8)
+        self.review_label = tk.Label(self.review_bar, text="", bg=DARK["surface2"], fg=DARK["text"],
+                                     font=(UI_FONT, 10, "bold"))
+        self.review_label.pack(side="left")
+        StyledButton(self.review_bar, "✓  Revisada, próxima →",
+                     command=lambda: self.finish_review(mark=True, go_next=True),
+                     padx=12, pady=4, font=(UI_FONT, 9, "bold")).pack(side="right")
+        StyledButton(self.review_bar, "← Voltar ao lote",
+                     command=lambda: self.finish_review(mark=False, go_next=False),
+                     style="secondary", padx=12, pady=4, font=(UI_FONT, 9)).pack(side="right", padx=(0, 8))
+
+        # Batch screen (hidden until the 📚 Lote tab)
+        self.batch_view = BatchView(self, self)
+
         # Body: song panel | (short excerpt) + strophes
-        body = tk.Frame(self, bg=DARK["bg"])
+        body = self.body = tk.Frame(self, bg=DARK["bg"])
         body.pack(fill="both", expand=True, padx=16, pady=16)
 
         self.song = SongPanel(body, on_pick_audio=self._pick_audio,
@@ -2777,7 +3183,7 @@ class App(tk.Tk):
         self.strophe_list.pack(fill="both", expand=True)
 
     def _bind_keys(self):
-        for key, fn in (("s", self._save_project), ("r", self._render),
+        for key, fn in (("s", self._save_project), ("r", self._render_shortcut),
                         ("o", self._open_project), ("n", self._new_project)):
             self.bind_all(f"<Control-{key}>", lambda e, f=fn: f())
             self.bind_all(f"<Control-{key.upper()}>", lambda e, f=fn: f())  # caps lock
@@ -2797,7 +3203,18 @@ class App(tk.Tk):
 
     def destroy(self):
         self._stop_play()
+        if self.batch_runner:
+            self.batch_runner.cancel()
+        if self._batch_save_job:
+            self._save_batch_now()
         super().destroy()
+
+    def _render_shortcut(self):
+        """Ctrl+R: renders the batch when the batch screen is open."""
+        if self.view == "batch":
+            self.batch_render()
+        else:
+            self._render()
 
     # ── Song panel ────────────────────────────
 
@@ -2851,8 +3268,11 @@ class App(tk.Tk):
 
     def set_background(self, path: str):
         self.project.bg_image = path
+        if self._single_stash is not None:  # reviewing: the background is shared
+            self._single_stash[0].bg_image = path
         self._save_cfg(bg_image=path)
         self._sync_background()
+        self.batch_view.refresh_shared()
         self._on_project_change()
 
     def _clear_bg(self):
@@ -2862,6 +3282,11 @@ class App(tk.Tk):
 
     def set_mode(self, mode: str):
         if mode == self.project.mode:
+            return
+        if self._reviewing is not None and mode == "short":
+            messagebox.showinfo("Lote", "O lote faz só vídeos 16:9. Pra fazer um short dessa "
+                                        "música, volte pro lote e use a aba  🎵 Uma música.",
+                                parent=self)
             return
         self.project.mode = mode
         self._save_cfg(mode=mode)
@@ -3008,6 +3433,9 @@ class App(tk.Tk):
         self._on_project_change()
 
     def _on_project_change(self):
+        if self.view == "batch":
+            self._batch_status()
+            return
         p = self.project
         n = len(p.strophes)
         name = os.path.basename(self._current_file) if self._current_file else "projeto não salvo"
@@ -3066,7 +3494,9 @@ class App(tk.Tk):
 
     def _new_project(self):
         if messagebox.askyesno("Novo projeto", "Descartar o projeto atual e começar outro?"):
+            self._leave_review_for_single()
             self._load_project(self._fresh_project(), None)
+            self.show_view("single")
 
     def _load_project(self, project: Project, path: Optional[str]):
         """Swap the current project and refresh everything."""
@@ -3089,9 +3519,13 @@ class App(tk.Tk):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            self._load_project(Project.from_dict(data), path)
+            project = Project.from_dict(data)
         except Exception as e:
             messagebox.showerror("Erro", f"Não foi possível abrir:\n{e}")
+            return
+        self._leave_review_for_single()
+        self._load_project(project, path)
+        self.show_view("single")
 
     def _save_project(self):
         if not self._current_file:
@@ -3192,6 +3626,366 @@ class App(tk.Tk):
             return None
         self._save_cfg(output_dir=os.path.dirname(os.path.abspath(final)))
         return final
+
+    # ── Batch (📚 Lote) ─────────────────────────
+
+    @property
+    def batch_running(self) -> bool:
+        return self.batch_runner is not None
+
+    def show_view(self, view: str):
+        """Switch between the single-song editor and the batch screen."""
+        if view == "batch" and self._reviewing is not None:
+            self.finish_review(mark=False, go_next=False)  # keeps the edits, shows the batch
+            return
+        self.view = view
+        for k, b in self.tab_btns.items():
+            on = k == view
+            b.config(bg=DARK["surface2"] if on else DARK["surface"],
+                     fg=DARK["text"] if on else DARK["text_dim"],
+                     activebackground=DARK["surface2"], activeforeground=DARK["text"])
+        if view == "batch":
+            self.body.pack_forget()
+            self.batch_view.pack(fill="both", expand=True, padx=16, pady=16)
+            self.batch_view.refresh()
+            self._batch_status()
+        else:
+            self.batch_view.pack_forget()
+            self.body.pack(fill="both", expand=True, padx=16, pady=16)
+            self._on_project_change()
+
+    def _batch_status(self):
+        items = self.batch_items
+        done = sum(1 for i in items if i.status == batch.DONE)
+        with_lyrics = sum(1 for i in items if i.strophes)
+        self.statusbar.config(text=f"Lote: {len(items)} música(s)   ·   {with_lyrics} com legenda"
+                                   f"   ·   {done} vídeo(s) pronto(s)")
+
+    def batch_changed(self):
+        """Something in the batch changed: save in a moment (debounced)."""
+        if self._batch_save_job:
+            self.after_cancel(self._batch_save_job)
+        self._batch_save_job = self.after(400, self._save_batch_now)
+
+    def _save_batch_now(self):
+        self._batch_save_job = None
+        batch.save_batch(self.batch_file, self.batch_items, self.batch_folder)
+
+    def batch_add(self):
+        paths = filedialog.askopenfilenames(
+            parent=self, title="Escolher os áudios das músicas",
+            initialdir=self.cfg.get("audio_dir") or None,
+            filetypes=[("Áudio", "*.mp3 *.wav *.ogg *.aac *.m4a *.flac"), ("Todos", "*.*")])
+        if not paths:
+            return
+        new = batch.new_items(paths, title_from_filename, self.batch_items)
+        self._save_cfg(audio_dir=os.path.dirname(paths[0]))
+        if new:
+            first = len(self.batch_items)
+            self.batch_items.extend(new)
+            self.batch_view.selected = first
+            self.batch_changed()
+        self.batch_view.refresh()
+        self._batch_status()
+        skipped = len(paths) - len(new)
+        with_txt = sum(1 for i in new if i.lyrics)
+        notes = []
+        if with_txt:
+            notes.append(f"{with_txt} letra(s) vieram de arquivos .txt com o mesmo nome.")
+        if skipped:
+            notes.append(f"{skipped} áudio(s) já estavam no lote.")
+        if notes:
+            messagebox.showinfo("Lote", "\n".join(notes), parent=self)
+
+    def batch_remove(self, idx: Optional[int]):
+        if idx is None or self.batch_running:
+            return
+        item = self.batch_items[idx]
+        if messagebox.askyesno("Remover", f"Tirar \"{item.title}\" do lote?\n"
+                                          "(o áudio e o vídeo não são apagados)", parent=self):
+            del self.batch_items[idx]
+            self.batch_changed()
+            self.batch_view.refresh()
+            self._batch_status()
+
+    def batch_clear(self):
+        if not self.batch_items or self.batch_running:
+            return
+        if messagebox.askyesno("Limpar o lote", f"Tirar as {len(self.batch_items)} músicas do lote?\n"
+                                                "(os áudios e vídeos não são apagados)", parent=self):
+            self.batch_items.clear()
+            self.batch_changed()
+            self.batch_view.refresh()
+            self._batch_status()
+
+    def batch_pick_folder(self) -> bool:
+        folder = filedialog.askdirectory(parent=self, title="Pasta onde os vídeos vão sair",
+                                         initialdir=self.batch_folder or self.cfg.get("output_dir") or None)
+        if not folder:
+            return False
+        self.batch_folder = folder
+        self._save_cfg(output_dir=folder)
+        self.batch_changed()
+        self.batch_view.refresh_shared()
+        return True
+
+    def batch_generate(self):
+        todo = [i for i, it in enumerate(self.batch_items) if not it.strophes]
+        if not todo:
+            msg = ("Adicione as músicas primeiro." if not self.batch_items else
+                   "Todas as músicas já têm legenda.\nPra refazer uma, use  ↻ Gerar de novo.")
+            messagebox.showinfo("Lote", msg, parent=self)
+            return
+        self._batch_start(todo, lyrics=True, render=False)
+
+    def batch_render(self):
+        items = self.batch_items
+        todo = [i for i, it in enumerate(items) if it.strophes and not it.rendered]
+        if not todo:
+            msg = ("Nenhuma música tem legenda ainda. Use  🎤 Gerar legendas  primeiro."
+                   if not any(it.strophes for it in items) else "Todos os vídeos já estão prontos.")
+            messagebox.showinfo("Lote", msg, parent=self)
+            return
+        not_reviewed = [i for i in todo if not items[i].reviewed]
+        without = sum(1 for it in items if not it.strophes)
+        notes = []
+        if not_reviewed:
+            notes.append(f"{len(not_reviewed)} música(s) ainda não foram revisadas.")
+        if without:
+            notes.append(f"{without} sem legenda vão ficar de fora.")
+        if notes and not messagebox.askyesno("Renderizar todas", "\n".join(notes) +
+                                             "\n\nRenderizar mesmo assim?", parent=self):
+            return
+        self._batch_start_render(todo, lyrics=False)
+
+    def batch_direct(self):
+        """⚡ Lyrics and video for each song, one after the other, without stopping."""
+        todo = [i for i, it in enumerate(self.batch_items) if not it.rendered]
+        if not todo:
+            messagebox.showinfo("Lote", "Adicione as músicas primeiro." if not self.batch_items
+                                else "Todos os vídeos já estão prontos.", parent=self)
+            return
+        self._batch_start_render(todo, lyrics=True)
+
+    def batch_regenerate(self, idx: Optional[int]):
+        if idx is None or self.batch_running:
+            return
+        item = self.batch_items[idx]
+        if item.strophes and not messagebox.askyesno(
+                "Gerar de novo", f"Gerar a legenda de \"{item.title}\" de novo?\n"
+                                 "A legenda atual (e as correções dela) vai ser substituída.", parent=self):
+            return
+        item.set_strophes([])
+        self._batch_start([idx], lyrics=True, render=False)
+
+    def batch_render_one(self, idx: Optional[int]):
+        if idx is None or self.batch_running or not self.batch_items[idx].strophes:
+            return
+        self.batch_items[idx].rendered = False
+        self._batch_start_render([idx], lyrics=False)
+
+    def _batch_start_render(self, indices: List[int], lyrics: bool):
+        if not (self.batch_folder and os.path.isdir(self.batch_folder)):
+            messagebox.showinfo("Pasta dos vídeos", "Escolha a pasta onde os vídeos vão sair.",
+                                parent=self)
+            if not self.batch_pick_folder():
+                return
+        # ask once about files that would be overwritten
+        existing = [i for i in indices
+                    if os.path.exists(batch.output_path(self.batch_items[i], self.batch_folder,
+                                                        safe_filename))]
+        skip = []
+        if existing:
+            names = "\n".join(f"• {safe_filename(self.batch_items[i].title)}.mp4" for i in existing[:8])
+            more = f"\n… e mais {len(existing) - 8}" if len(existing) > 8 else ""
+            answer = messagebox.askyesnocancel(
+                "Arquivos já existem",
+                f"Já existe vídeo com esse nome na pasta:\n{names}{more}\n\n"
+                "Sim = substituir   ·   Não = pular essas   ·   Cancelar = não renderizar",
+                icon="warning", parent=self)
+            if answer is None:
+                return
+            if answer is False:
+                skip = existing
+        self._batch_start(indices, lyrics=lyrics, render=True, skip=skip)
+
+    def _batch_start(self, indices: List[int], lyrics: bool, render: bool, skip=()):
+        if self.batch_running:
+            return
+        items = self.batch_items
+        missing = [items[i].title for i in indices if not os.path.isfile(items[i].audio_file)]
+        if missing:
+            messagebox.showerror("Áudio não encontrado",
+                                 "Esses áudios não existem mais (foram movidos ou apagados?):\n\n"
+                                 + "\n".join(f"• {t}" for t in missing[:8]), parent=self)
+            return
+        if lyrics and any(not items[i].strophes for i in indices) and not auto_lyrics.is_available():
+            messagebox.showerror("Whisper não instalado",
+                                 "A legenda automática precisa do faster-whisper.\n\n"
+                                 "Feche e abra o programa de novo pra instalar.", parent=self)
+            return
+
+        opts = self.batch_view.options()
+        self._save_cfg(whisper_model=opts["model"], language=opts["language_label"],
+                       ignore_tags=opts["ignore_tags"])
+        cfg = dict(self.cfg)                       # snapshot: the worker never reads Tk/App state
+        bg = self.project.bg_image if self._single_stash is None else self._single_stash[0].bg_image
+        folder = self.batch_folder
+
+        def generate_lyrics(item, progress, cancel):
+            try:
+                result = auto_lyrics.generate(item.audio_file, item.lyrics, opts["model"],
+                                              opts["language"], progress=progress, cancel=cancel,
+                                              ignore_tags=opts["ignore_tags"])
+            except auto_lyrics.Cancelled:
+                raise batch.Cancelled()
+            return [asdict(Strophe(id=n + 1, start_time=s.start, end_time=s.end, text=s.text,
+                                   words=[[w.text, round(w.start, 3), round(w.end, 3)]
+                                          for w in s.words]))
+                    for n, s in enumerate(result)]
+
+        def render_video(item, out, progress, cancel):
+            os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+            project = batch_project(item, cfg, bg)
+            return FrameRenderer(project).render_video(out, audio_path=item.audio_file,
+                                                       progress_callback=progress,
+                                                       cancel_flag=cancel)
+
+        self.batch_runner = batch.BatchRunner(
+            items, generate_lyrics, render_video,
+            out_path=lambda item: batch.output_path(item, folder, safe_filename),
+            on_event=lambda kind, i, value: self.post(lambda: self._batch_event(kind, i, value)))
+        self._batch_order = list(indices)
+        runner = self.batch_runner
+        self.batch_view.set_running(True)
+        self.batch_view.show_progress("Começando…", 0)
+        self.start_worker(lambda: runner.run(indices, do_lyrics=lyrics, do_render=render,
+                                             skip_render=skip))
+
+    def batch_stop(self):
+        if self.batch_runner:
+            self.batch_runner.cancel()
+            self.batch_view.show_progress("Parando… (termina o passo atual)", 0)
+
+    def _batch_event(self, kind: str, i: int, value):
+        view = self.batch_view
+        if kind == "start":
+            item = self.batch_items[i]
+            pos = self._batch_order.index(i) + 1 if i in self._batch_order else 0
+            what = "gerando a legenda" if value == batch.GENERATING else "renderizando o vídeo"
+            self._batch_step = f"Música {pos} de {len(self._batch_order)}: {item.title} — {what}"
+            view.show_progress(self._batch_step, 0)
+            view.update_row(i)
+        elif kind == "progress":
+            view.show_progress(f"{getattr(self, '_batch_step', '')}  {int(value * 100)}%", value)
+        elif kind == "item":
+            view.update_row(i)
+            self.batch_changed()
+            self._batch_status()
+        elif kind == "finished":
+            self.stop_worker()
+            self.batch_runner = None
+            view.set_running(False)
+            view.refresh()
+            self._save_batch_now()
+            self._batch_status()
+            self._batch_finished(value)
+
+    def _batch_finished(self, summary: dict):
+        parts = []
+        if summary["lyrics"]:
+            parts.append(f"{summary['lyrics']} legenda(s) gerada(s)")
+        if summary["videos"]:
+            parts.append(f"{summary['videos']} vídeo(s) pronto(s)")
+        if summary["errors"]:
+            parts.append(f"{summary['errors']} com erro (veja na lista)")
+        text = ", ".join(parts) or "Nada foi feito"
+        if summary["cancelled"]:
+            self.batch_view.show_progress(f"Parado. {text}.", 0)
+            return
+        self.batch_view.show_progress(f"Pronto: {text}.", 1)
+        tip = ""
+        if summary["lyrics"] and not summary["videos"]:
+            tip = ("\n\nAgora confira: clique em  ✎ Revisar legenda  (ou dê duplo clique na música). "
+                   "Depois,  ▶ Renderizar todas.")
+        elif summary["videos"]:
+            tip = f"\n\nOs vídeos estão em:\n{self.batch_folder}"
+        messagebox.showinfo("Lote", f"{text}.{tip}", parent=self)
+
+    # Review: a batch song opened in the normal editor
+
+    def open_review(self, idx: Optional[int]):
+        items = self.batch_items
+        if idx is None or not (0 <= idx < len(items)):
+            return
+        item = items[idx]
+        if not item.strophes or item.busy:
+            return
+        if self._reviewing is None:
+            self._single_stash = (self.project, self._current_file, self._lyrics_audio)
+            bg = self.project.bg_image
+        else:
+            self._store_review()
+            bg = self._single_stash[0].bg_image
+        self._reviewing = idx
+        self._load_project(batch_project(item, self.cfg, bg), None)
+        self._lyrics_audio = item.audio_file
+        reviewable = [i for i, it in enumerate(items) if it.strophes]
+        pos = reviewable.index(idx) + 1
+        self.review_label.config(text=f"📚 Revisando do lote:  {item.title}   ({pos} de {len(reviewable)})")
+        self.show_view("single")  # the editor must be on screen before the bar goes above it
+        self.review_bar.pack(fill="x", padx=16, pady=(12, 0), before=self.body)
+
+    def _store_review(self):
+        """Copy the edits of the song being reviewed back into the batch."""
+        item = self.batch_items[self._reviewing]
+        strophes = [asdict(s) for s in sorted(self.project.strophes, key=lambda s: s.start_time)]
+        if strophes != item.strophes:
+            item.strophes = strophes
+            item.rendered = False   # the old video doesn't match anymore
+            item.error = ""
+        item.title = self.project.title
+        self.batch_changed()
+
+    def finish_review(self, mark: bool, go_next: bool):
+        if self._reviewing is None:
+            return
+        idx = self._reviewing
+        self._store_review()
+        if mark:
+            self.batch_items[idx].reviewed = True
+            self.batch_changed()
+        if go_next:
+            n = len(self.batch_items)
+            nxt = next((j % n for j in range(idx + 1, idx + n)
+                        if self.batch_items[j % n].strophes and not self.batch_items[j % n].reviewed
+                        and not self.batch_items[j % n].busy), None)
+            if nxt is not None:
+                self.open_review(nxt)
+                return
+            messagebox.showinfo("Tudo revisado", "Todas as músicas com legenda já foram revisadas.\n\n"
+                                                 "Agora é só  ▶ Renderizar todas.", parent=self)
+        self._end_review()
+        self.batch_view.selected = idx
+        self.show_view("batch")
+
+    def _end_review(self):
+        """Put the single-song project back (with the current style/background)."""
+        project, path, lyrics_audio = self._single_stash
+        apply_style(project, self.cfg)
+        bg = self.cfg.get("bg_image", "")
+        project.bg_image = bg if bg and os.path.isfile(bg) else ""
+        self._reviewing = None
+        self._single_stash = None
+        self.review_bar.pack_forget()
+        self._load_project(project, path)
+        self._lyrics_audio = lyrics_audio
+
+    def _leave_review_for_single(self):
+        """Opening/creating a project while reviewing: save the review first."""
+        if self._reviewing is not None:
+            self._store_review()
+            self._end_review()
 
     def check_ffmpeg(self):
         status = deps.ffmpeg_status()

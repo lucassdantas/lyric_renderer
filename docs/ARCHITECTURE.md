@@ -72,6 +72,14 @@ App desktop em Tkinter. O arquivo principal ([lyric_renderer.py](../lyric_render
 - **Interface**: chave Vídeo/Short no `SongPanel`; prévia em pé desenhada direto no tamanho pequeno (`FrameRenderer(scale=…)`), rápida o bastante pra seguir o mouse ao arrastar o fundo; `ClipBar` (início/fim, ▶ Ouvir com `ffplay`, "Usar estrofes marcadas" com Shift+clique na lista); estrofes fora do trecho ficam apagadas. O botão de renderizar é empacotado primeiro na coluna, então é a última coisa a ser cortada se faltar espaço (há teste que confere que a coluna cabe em 1280×800 nos dois modos).
 - **Configuração**: `cfg["short"]` guarda tamanhos, efeitos e a posição do fundo (mesma imagem em todos os shorts); `cfg["mode"]` lembra o último modo. O trecho é por música e não vai pra config.
 
+## Lote ([batch.py](../batch.py) + `BatchView`)
+- **`batch.py`** não conhece Tk nem o renderizador: `BatchItem` (áudio, título, letra colada, estrofes como dicts, revisada/renderizada/erro; `status` é derivado), `find_lyrics_file` (`.txt` de mesmo nome, sem diferenciar maiúscula, UTF-8 ou cp1252), `new_items` (ignora áudio repetido), `output_path`, `save_batch`/`load_batch` e o **`BatchRunner`**.
+- **`BatchRunner.run(indices, do_lyrics, do_render, skip_render)`** processa **uma música por vez** (Whisper e o render já usam a CPU toda). Recebe as funções pesadas prontas (`generate`, `render`), então é testado sem Whisper/FFmpeg. Erro numa música vira `item.error` e a fila segue; `cancel()` para depois do passo atual sem marcar nada pela metade. Eventos (`start`/`progress`/`item`/`finished`) saem da thread e o `App` os executa na thread do Tk (`WorkerMixin.post`).
+- **Persistência**: `lote.json` ao lado do `config.json`, salvo com debounce a cada mudança e ao fechar. O estado "rodando" (`busy`) não é salvo.
+- **App**: abas 🎵 Uma música / 📚 Lote no cabeçalho (`show_view`). Antes de rodar, o App tira uma **cópia** da config e do fundo — a thread nunca lê o estado da interface. `batch_project(item, cfg, bg)` monta o `Project` de cada música (estilo salvo + fundo compartilhado + estrofes; sempre 16:9).
+- **Revisão**: `open_review` guarda o projeto da tela de uma música (`_single_stash`), abre a música do lote no editor normal e mostra a barra "Revisando do lote". `finish_review` copia título/estrofes de volta (se a legenda mudou, o vídeo antigo deixa de valer), opcionalmente marca como revisada e abre a próxima não revisada; ao sair, o projeto guardado volta. Abrir/criar projeto ou clicar na aba do lote durante a revisão salva a revisão antes. Short fica bloqueado na revisão.
+- **Sobrescrever**: antes de renderizar, uma única pergunta pra todos os arquivos que já existem (substituir / pular / cancelar).
+
 ## Legenda automática ([auto_lyrics.py](../auto_lyrics.py))
 ```
 áudio ──ffmpeg──▶ PCM 16 kHz ──faster-whisper (CPU, int8)──▶ palavras com tempo
@@ -107,6 +115,9 @@ python -m unittest discover -s tests -t .
 - `test_auto_lyrics.py`: colchetes, agrupamento, alinhamento, leitura de WAV. Whisper real só com `LYRIC_SLOW_TESTS=1 LYRIC_TEST_AUDIO=musica.wav [LYRIC_TEST_LYRICS=letra.txt]`
 - `test_gui.py`: tela principal, configurações salvas, prévia, render (aviso de substituir), legenda automática, rolagem, checagem de dependências (janelas escondidas, diálogos simulados)
 - `test_deps.py`: pacotes faltando, pip, estados do FFmpeg
+- `test_batch.py`: itens, `.txt` de letra, salvar/carregar, fila (só legenda, direto, erros, parar)
+- `test_batch_gui.py`: tela do lote de ponta a ponta com a IA e o render simulados (gerar, revisar → próxima, renderizar, sobrescrever, parar)
+- `tests/__init__.py` troca todos os avisos/janelas de arquivo por um que **falha o teste** — nenhum teste pode abrir janela de verdade na tela de quem está usando o PC
 - `test_short.py`: tempo das palavras, telas de 1–2 versos, quebra equilibrada, corte do fundo, efeitos (medidos nos pixels), arquivo `.lyr` com short, áudio do trecho
 
 ## Limitações conhecidas
