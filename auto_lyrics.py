@@ -21,7 +21,7 @@ import sys
 import types
 import unicodedata
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
 
 SAMPLE_RATE = 16000
@@ -69,6 +69,8 @@ class TimedStrophe:
     start: float
     end: float
     text: str
+    # one Word per word of text.split(), when the timing is known
+    words: List[Word] = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────
@@ -279,7 +281,7 @@ def _finish(strophes: List[TimedStrophe], audio_end: Optional[float]) -> List[Ti
         if audio_end:
             end = min(end, audio_end)
         end = max(end, start + 0.5)
-        out.append(TimedStrophe(round(start, 2), round(end, 2), s.text))
+        out.append(TimedStrophe(round(start, 2), round(end, 2), s.text, s.words))
     return out
 
 
@@ -309,7 +311,11 @@ def group_lines(words: List[Word], audio_end: Optional[float] = None) -> List[Ti
     timed = []
     for block in strophes:
         text = "\n".join(_line_text(line) for line in block)
-        timed.append(TimedStrophe(block[0][0].start, block[-1][-1].end, text))
+        heard = [w for line in block for w in line]
+        tokens = text.split()
+        words = ([Word(tok, w.start, w.end) for tok, w in zip(tokens, heard)]
+                 if len(tokens) == len(heard) else [])
+        timed.append(TimedStrophe(block[0][0].start, block[-1][-1].end, text, words))
     return _finish(timed, audio_end)
 
 
@@ -343,21 +349,33 @@ def align_lyrics(lyrics: str, words: List[Word],
     if not strophes:
         return []
 
-    lyric_tokens, owner = [], []  # normalized lyric words, strophe index of each
+    # Every word shown on screen (display) and, among them, the ones that are
+    # sung (lyric_tokens, normalized) with their (strophe, word) position.
+    display: List[List[str]] = []
+    lyric_tokens, owner = [], []
     for i, lines in enumerate(strophes):
-        for w in strip_tags(" ".join(lines)).split():
-            n = normalize_word(w)
-            if n:
-                lyric_tokens.append(n)
-                owner.append(i)
+        toks = []
+        for line in lines:
+            tag_spans = [m.span() for m in _TAG.finditer(line)]
+            for m in re.finditer(r"\S+", line):
+                toks.append(m.group())
+                if any(a < m.end() and m.start() < b for a, b in tag_spans):
+                    continue  # kept [tag]: shown but never sung
+                n = normalize_word(m.group())
+                if n:
+                    lyric_tokens.append(n)
+                    owner.append((i, len(toks) - 1))
+        display.append(toks)
 
     heard = [normalize_word(w.text) for w in words]
+    timing = [[None] * len(t) for t in display]
     spans: List[Optional[Tuple[float, float]]] = [None] * len(strophes)
     matcher = difflib.SequenceMatcher(None, lyric_tokens, heard, autojunk=False)
     for block in matcher.get_matching_blocks():
         for k in range(block.size):
-            i = owner[block.a + k]
+            i, j = owner[block.a + k]
             w = words[block.b + k]
+            timing[i][j] = (w.start, w.end)
             if spans[i] is None:
                 spans[i] = (w.start, w.end)
             else:
@@ -374,23 +392,70 @@ def align_lyrics(lyrics: str, words: List[Word],
                                len(spans) - i - 1)
             length = max((nxt - prev_end) / missing, 0.5)
             spans[i] = (prev_end, prev_end + length)
-        timed.append(TimedStrophe(spans[i][0], spans[i][1], "\n".join(lines)))
+        timed.append(TimedStrophe(spans[i][0], spans[i][1], "\n".join(lines),
+                                  _fill_word_times(display[i], timing[i], spans[i])))
     return _finish(timed, audio_end)
+
+
+def _fill_word_times(tokens: List[str], timing: list, span: Tuple[float, float]) -> List[Word]:
+    """Words not recognized in the audio share the time between their
+    recognized neighbours (or the strophe edges) evenly."""
+    out: List[Word] = []
+    i, n = 0, len(tokens)
+    while i < n:
+        if timing[i] is not None:
+            out.append(Word(tokens[i], *timing[i]))
+            i += 1
+            continue
+        j = i
+        while j < n and timing[j] is None:
+            j += 1
+        left = out[-1].end if out else span[0]
+        right = timing[j][0] if j < n else span[1]
+        right = max(right, left)
+        step = (right - left) / (j - i)
+        for k in range(i, j):
+            a = left + (k - i) * step
+            out.append(Word(tokens[k], a, a + step))
+        i = j
+    return out
+
+
+def _shift(strophes: List[TimedStrophe], offset: float) -> List[TimedStrophe]:
+    if not offset:
+        return strophes
+    return [TimedStrophe(round(s.start + offset, 2), round(s.end + offset, 2), s.text,
+                         [Word(w.text, w.start + offset, w.end + offset) for w in s.words])
+            for s in strophes]
 
 
 def generate(audio_path: str, lyrics: str = "", model_size: str = DEFAULT_MODEL,
              language: Optional[str] = "pt",
              progress: Optional[Callable[[float], None]] = None,
              cancel: Optional[Callable[[], bool]] = None,
-             ignore_tags: bool = True) -> List[TimedStrophe]:
-    """Full pipeline: audio file (+ optional lyrics) → timed strophes."""
+             ignore_tags: bool = True,
+             start: Optional[float] = None,
+             end: Optional[float] = None) -> List[TimedStrophe]:
+    """
+    Full pipeline: audio file (+ optional lyrics) → timed strophes.
+    With start/end only that excerpt is listened to (shorts: faster, and the
+    chorus lyrics don't get matched to another repetition of the chorus);
+    the times returned are still song times.
+    """
     audio = load_audio(audio_path)
+    offset = 0.0
+    if start is not None or end is not None:
+        a = int(max(start or 0.0, 0.0) * SAMPLE_RATE)
+        b = int(end * SAMPLE_RATE) if end else len(audio)
+        if b - a < SAMPLE_RATE // 2:
+            raise AutoLyricsError("O trecho escolhido é curto demais.")
+        audio, offset = audio[a:b], a / SAMPLE_RATE
     audio_end = len(audio) / SAMPLE_RATE
     # the hint for Whisper is only what is actually sung: never the [tags]
     prompt = " ".join(" ".join(lines) for lines in split_lyrics(lyrics, True)) if lyrics.strip() else ""
     words = transcribe_words(audio, model_size, language, prompt, progress, cancel)
     if lyrics.strip():
-        return align_lyrics(lyrics, words, audio_end, ignore_tags)
+        return _shift(align_lyrics(lyrics, words, audio_end, ignore_tags), offset)
     if not words:
         raise AutoLyricsError("Nenhuma voz foi reconhecida no áudio.")
-    return group_lines(words, audio_end)
+    return _shift(group_lines(words, audio_end), offset)

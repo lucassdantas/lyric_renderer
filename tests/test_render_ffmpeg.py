@@ -72,6 +72,25 @@ class FfmpegRenderTest(unittest.TestCase):
         self.assertTrue(ok, path)
         self.assertGreaterEqual(lr.probe_duration(path), 5.4)  # 4 + 1.5 tail
 
+    def test_short_renders_only_the_excerpt_vertical(self):
+        p = lr.Project(fps=10, mode="short", transparent_bg=True,
+                       strophes=[lr.Strophe(1, 1.5, 3.5, "oi\ntchau")])
+        p.short.clip_start, p.short.clip_end = 1.0, 4.0
+        ok, path = lr.FrameRenderer(p).render_video(self.out("short.mp4"), audio_path=self.audio)
+        self.assertTrue(ok, path)
+        self.assertTrue(path.endswith(".mp4"))  # shorts are never transparent .webm
+        info = ffprobe(path, "stream=codec_name,width,height")
+        self.assertIn("width=1080", info)
+        self.assertIn("height=1920", info)
+        self.assertIn("codec_name=aac", info)
+        self.assertAlmostEqual(lr.probe_duration(path), 3.0, delta=0.15)
+
+    def test_short_without_excerpt_is_refused(self):
+        p = lr.Project(mode="short", strophes=[lr.Strophe(1, 0, 1, "x")])
+        ok, msg = lr.FrameRenderer(p).render_video(self.out("nope.mp4"))
+        self.assertFalse(ok)
+        self.assertIn("trecho", msg)
+
     def test_cancel(self):
         ok, msg = lr.FrameRenderer(self.project()).render_video(
             self.out("c.webm"), cancel_flag=lambda: True)

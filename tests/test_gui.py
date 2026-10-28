@@ -468,6 +468,212 @@ class AppTest(unittest.TestCase):
         self.assertEqual(dialog.model_var.get(), lr.auto_lyrics.MODELS["medium"])
         dialog.destroy()
 
+    # ── Short mode ───────────────────────────────────────
+
+    def _song_with_strophes(self):
+        self.app.set_audio(self._file("musica.wav"))
+        self.app.project.strophes = [lr.Strophe(1, 2, 10, "verso 1\nverso 2"),
+                                     lr.Strophe(2, 14, 22, "refrão 1\nrefrão 2\nrefrão 3\nrefrão 4"),
+                                     lr.Strophe(3, 27, 34, "fim")]
+        self.app.strophe_list.refresh()
+
+    def test_switching_to_short_shows_the_excerpt_bar(self):
+        self.assertFalse(self.app.clip_bar.winfo_manager())
+        self.app.set_mode("short")
+        self.assertEqual(self.app.project.mode, "short")
+        self.assertEqual(self.app.clip_bar.winfo_manager(), "pack")
+        self.assertIn("short", self.app.song.render_btn.cget("text"))
+        self.assertEqual(lr.load_config(self.cfg_path)["mode"], "short")
+        self.app.set_mode("video")
+        self.assertFalse(self.app.clip_bar.winfo_manager())
+
+    def test_left_column_fits_the_default_window_in_both_modes(self):
+        # 800px window - header (60) - status bar - body padding (2×16)
+        self.app.update_idletasks()
+        available = 800 - 60 - self.app.statusbar.winfo_reqheight() - 32
+        for mode in ("video", "short"):
+            self.app.set_mode(mode)
+            self.app.update_idletasks()
+            self.assertLessEqual(self.app.song.winfo_reqheight(), available, mode)
+        # and the render button is packed first, so it'd be the last thing cut
+        self.assertIs(self.app.song.pack_slaves()[0], self.app.song.render_btn)
+
+    def test_excerpt_from_marked_strophes(self):
+        self._song_with_strophes()
+        self.app.set_mode("short")
+        sl = self.app.strophe_list
+        sl.select(2)
+        sl.select(3, extend=True)  # Shift+click
+        self.assertEqual([s.id for s in sl.marked_strophes()], [2, 3])
+        self.app._use_marked_as_clip()
+        sh = self.app.project.short
+        self.assertAlmostEqual(sh.clip_start, 13.7)
+        self.assertAlmostEqual(sh.clip_end, 34.5)
+        self.assertEqual(self.app.clip_bar.start_entry.var.get(), "00:13")
+
+    def test_excerpt_needs_marked_strophes(self):
+        self.app.set_mode("short")
+        self.app.strophe_list.marked = set()
+        with mock.patch.object(lr.messagebox, "showinfo") as info:
+            self.app._use_marked_as_clip()
+        info.assert_called_once()
+
+    def test_typing_the_excerpt_dims_strophes_outside(self):
+        self._song_with_strophes()
+        self.app.set_mode("short")
+        type_into(self.app.clip_bar.start_entry, "13")
+        type_into(self.app.clip_bar.end_entry, "23")
+        self.assertEqual((self.app.project.short.clip_start, self.app.project.short.clip_end), (13, 23))
+        cards = self.app.strophe_list.scrollable_frame.winfo_children()
+        lyric = lambda card: [w for w in card.winfo_children()[1].winfo_children()
+                              if isinstance(w, tk.Label)][0]
+        self.assertEqual(lyric(cards[0]).cget("fg"), lr.DARK["text_dim"])  # 2–10s: outside
+        self.assertEqual(lyric(cards[1]).cget("fg"), lr.DARK["text"])      # 14–22s: inside
+
+    def test_drag_and_zoom_background(self):
+        self.app.set_background(self._image())  # 64×36 landscape
+        self.app.set_mode("short")
+        sh = self.app.project.short
+        self.app._drag_bg(0.2, 0)   # drag right → shows more of the left side
+        self.assertLess(sh.bg_x, 0.5)
+        self.app._drag_bg(-5, 0)    # way left: stops at the right edge
+        self.assertEqual(sh.bg_x, 1.0)
+        self.app._zoom_bg(3)
+        self.assertAlmostEqual(sh.bg_zoom, 1.08 ** 3)
+        self.app._zoom_bg(-50)
+        self.assertEqual(sh.bg_zoom, 1.0)
+        self.app._center_bg()
+        self.assertEqual((sh.bg_x, sh.bg_y, sh.bg_zoom), (0.5, 0.5, 1.0))
+
+    def test_background_position_is_remembered(self):
+        self.app.set_background(self._image())
+        self.app.set_mode("short")
+        self.app._drag_bg(0.2, 0)
+        x = self.app.project.short.bg_x
+        self.app.update()
+        self.app.after(600)
+        self.app.update()  # the save is debounced
+        self.assertAlmostEqual(lr.load_config(self.cfg_path)["short"]["bg_x"], x)
+
+    def test_short_preview_is_vertical(self):
+        self._song_with_strophes()
+        self.app.set_mode("short")
+        self.app.strophe_list.select(2)
+        self.app._update_preview()
+        prev = self.app.song._preview
+        self.assertEqual((prev.width(), prev.height()),
+                         (lr.SongPanel.SHORT_PREVIEW_W, lr.SongPanel.SHORT_PREVIEW_H))
+        self.assertIn("tela 1 de 2", self.app.song.preview_caption.cget("text"))
+
+    def test_render_short_requires_excerpt(self):
+        self._song_with_strophes()
+        self.app.set_mode("short")
+        with mock.patch.object(lr.messagebox, "showwarning") as warn, \
+             mock.patch.object(lr.filedialog, "asksaveasfilename") as save:
+            self.app._render()
+        warn.assert_called_once()
+        save.assert_not_called()
+
+    def test_render_short_suggests_short_file_name(self):
+        self._song_with_strophes()
+        self.app.set_mode("short")
+        self.app.project.short.clip_start, self.app.project.short.clip_end = 13, 23
+        with mock.patch.object(lr.filedialog, "asksaveasfilename", return_value="") as save:
+            self.app._render()
+        self.assertEqual(save.call_args.kwargs["initialfile"], "Musica - Short.mp4")
+
+    def test_play_excerpt_with_ffplay(self):
+        self._song_with_strophes()
+        self.app.set_mode("short")
+        self.app.project.short.clip_start, self.app.project.short.clip_end = 13, 23
+        fake = mock.Mock()
+        fake.poll.return_value = None
+        with mock.patch.object(lr.shutil, "which", return_value="ffplay"), \
+             mock.patch.object(lr.subprocess, "Popen", return_value=fake) as popen:
+            self.app._toggle_play()
+            cmd = popen.call_args.args[0]
+            self.assertEqual(cmd[cmd.index("-ss") + 1], "13.00")
+            self.assertEqual(cmd[cmd.index("-t") + 1], "10.00")
+            self.assertEqual(self.app.clip_bar.play_btn.cget("text"), "⏹ Parar")
+            self.app._toggle_play()  # second click stops
+        fake.terminate.assert_called_once()
+        self.assertEqual(self.app.clip_bar.play_btn.cget("text"), "▶ Ouvir")
+
+    def test_play_without_ffplay(self):
+        self._song_with_strophes()
+        self.app.set_mode("short")
+        self.app.project.short.clip_start, self.app.project.short.clip_end = 13, 23
+        with mock.patch.object(lr.shutil, "which", return_value=None), \
+             mock.patch.object(lr.messagebox, "showerror") as err:
+            self.app._toggle_play()
+        err.assert_called_once()
+
+    def test_auto_lyrics_in_short_replaces_only_the_excerpt(self):
+        self._song_with_strophes()
+        self.app.set_mode("short")
+        self.app.project.short.clip_start, self.app.project.short.clip_end = 13, 23
+        self.app._lyrics_audio = None
+        dialog = self._auto_dialog(audio=False)
+        self.assertEqual(dialog.clip, (13, 23))
+        new = [lr.auto_lyrics.TimedStrophe(14.2, 18, "refrão novo 1\nrefrão novo 2",
+                                           [lr.auto_lyrics.Word(w, 14.5 + i, 15 + i) for i, w in
+                                            enumerate("refrão novo 1 refrão novo 2".split())])]
+        with mock.patch.object(lr.messagebox, "askyesno", return_value=True), \
+             mock.patch.object(lr.messagebox, "showinfo"):
+            dialog._on_done(True, new)
+        texts = [s.text for s in self.app.project.strophes]
+        self.assertEqual(texts, ["verso 1\nverso 2", "refrão novo 1\nrefrão novo 2", "fim"])
+        refrao = self.app.project.strophes[1]
+        self.assertEqual(refrao.words[0], ["refrão", 14.5, 15.0])
+        self.assertEqual(len({s.id for s in self.app.project.strophes}), 3)
+
+    def test_auto_lyrics_in_short_passes_the_excerpt(self):
+        self._song_with_strophes()
+        self.app.set_mode("short")
+        self.app.project.short.clip_start, self.app.project.short.clip_end = 13, 23
+        dialog = self._auto_dialog(audio=False)
+        with mock.patch.object(lr.auto_lyrics, "is_available", return_value=True), \
+             mock.patch.object(lr.auto_lyrics, "generate", return_value=[]) as gen, \
+             mock.patch.object(lr.messagebox, "showwarning"):
+            dialog._start()
+            for _ in range(100):
+                self.app.update()
+                if gen.called and not dialog.running:
+                    break
+                self.app.after(10)
+        self.assertEqual((gen.call_args.kwargs["start"], gen.call_args.kwargs["end"]), (13, 23))
+        dialog.destroy()
+
+    def test_editing_times_keeps_word_timing(self):
+        self.app.project.strophes = [lr.Strophe(1, 10, 14, "a b", words=[["a", 10, 12], ["b", 12, 14]])]
+        self.app.strophe_list.refresh()
+        self.app.strophe_list._edit(1)
+        editor = next(w for w in self.app.strophe_list.winfo_children()
+                      if isinstance(w, lr.StropheEditor))
+        type_into(editor.start_entry, "20")
+        type_into(editor.end_entry, "28")
+        editor._save()
+        self.assertEqual(self.app.project.strophes[0].words, [["a", 20, 24], ["b", 24, 28]])
+
+    def test_short_settings_saved(self):
+        d = self._settings()
+        d.panel.short_lines_var.set("1")
+        d.panel.short_lyric_size_var.set(110)
+        d.panel.short_fx_vars["fx_slide"].set(False)
+        d.panel.fx_vars["fx_karaoke"].set(True)  # effects can be turned on in the normal video
+        d._save()
+        p = self.app.project
+        self.assertEqual((p.short.lines_per_screen, p.short.lyric_size, p.short.fx_slide, p.fx_karaoke),
+                         (1, 110, False, True))
+        cfg = lr.load_config(self.cfg_path)
+        self.assertEqual((cfg["short"]["lines_per_screen"], cfg["fx_karaoke"]), (1, True))
+
+    def test_effects_default_on_only_in_shorts(self):
+        d = self._settings()
+        self.assertFalse(any(v.get() for k, v in d.panel.fx_vars.items() if k.startswith("fx_")))
+        self.assertTrue(all(v.get() for k, v in d.panel.short_fx_vars.items() if k.startswith("fx_")))
+        d.destroy()
+
     # ── Mouse wheel ──────────────────────────────────────
 
     def _wheel(self, widget, delta):

@@ -60,6 +60,18 @@ App desktop em Tkinter. O arquivo principal ([lyric_renderer.py](../lyric_render
 - `bind_wheel_scroll`: a roda vai pro widget embaixo do mouse, então escutamos no app inteiro e filtramos pelo caminho do widget.
 - `report_callback_exception`: erro num botão vira janela de erro + `erros.log` na pasta da config (pelo atalho não há terminal).
 
+## Modo short (9:16)
+`Project.mode` = `"video"` ou `"short"`. Tudo que é do short fica em `Project.short` (`ShortSettings`): trecho (`clip_start`/`clip_end`, em tempo da música), tamanhos, versos por tela, fade, posição/zoom do fundo e efeitos. Um `.lyr` antigo abre com os padrões.
+
+- **Tempo das palavras**: `Strophe.words` = `[palavra, início, fim]` pra cada palavra de `text.split()`. Vem da legenda automática; editar só os tempos de uma estrofe reescala (`rescale_words`), editar o texto descarta; sem dado, `strophe_words` estima pelo tamanho das palavras.
+- **Telas** (`build_screens`): no short cada estrofe vira telas de N versos. Cada tela vai do fim da anterior até o fim da sua última palavra + fade; se os versos são cantados colados, troca no meio do intervalo. No vídeo normal é uma tela por estrofe (igual a antes).
+- **Renderizador**: `FrameRenderer` pede quadros pelo **tempo da música**; o short começa em `clip_start` e dura o trecho. 1080×1920, título no topo (11%) e letra em 46% da altura (fora da área dos botões do YouTube), quebra de linha **equilibrada** (`wrap_words`: "A felicidade / mora no comum" em vez de deixar uma palavra sozinha). Fundo: "cover" (`cover_box`) na posição escolhida — nunca estica; o short nunca é transparente.
+- **Efeitos** (no short ligados por padrão; no vídeo normal existem desligados): `fx_slide` (entra pela esquerda/sai pela direita), `fx_transition` (entra de baixo/sai pra cima), `fx_zoom` (fundo aproxima 8% ao longo do vídeo), `fx_karaoke` (palavra já cantada na cor do karaokê). O movimento usa a mesma curva do fade.
+- **Áudio do trecho**: `build_ffmpeg_cmd(audio_start, audio_duration)` → `-ss/-t` + `afade` na entrada (0,15s) e na saída (1s).
+- **Legenda automática no trecho**: `auto_lyrics.generate(start, end)` corta o áudio, transcreve só aquilo (mais rápido e o refrão colado não casa com outra repetição dele) e devolve tempos da música; o diálogo troca só as estrofes que caem no trecho.
+- **Interface**: chave Vídeo/Short no `SongPanel`; prévia em pé desenhada direto no tamanho pequeno (`FrameRenderer(scale=…)`), rápida o bastante pra seguir o mouse ao arrastar o fundo; `ClipBar` (início/fim, ▶ Ouvir com `ffplay`, "Usar estrofes marcadas" com Shift+clique na lista); estrofes fora do trecho ficam apagadas. O botão de renderizar é empacotado primeiro na coluna, então é a última coisa a ser cortada se faltar espaço (há teste que confere que a coluna cabe em 1280×800 nos dois modos).
+- **Configuração**: `cfg["short"]` guarda tamanhos, efeitos e a posição do fundo (mesma imagem em todos os shorts); `cfg["mode"]` lembra o último modo. O trecho é por música e não vai pra config.
+
 ## Legenda automática ([auto_lyrics.py](../auto_lyrics.py))
 ```
 áudio ──ffmpeg──▶ PCM 16 kHz ──faster-whisper (CPU, int8)──▶ palavras com tempo
@@ -95,6 +107,7 @@ python -m unittest discover -s tests -t .
 - `test_auto_lyrics.py`: colchetes, agrupamento, alinhamento, leitura de WAV. Whisper real só com `LYRIC_SLOW_TESTS=1 LYRIC_TEST_AUDIO=musica.wav [LYRIC_TEST_LYRICS=letra.txt]`
 - `test_gui.py`: tela principal, configurações salvas, prévia, render (aviso de substituir), legenda automática, rolagem, checagem de dependências (janelas escondidas, diálogos simulados)
 - `test_deps.py`: pacotes faltando, pip, estados do FFmpeg
+- `test_short.py`: tempo das palavras, telas de 1–2 versos, quebra equilibrada, corte do fundo, efeitos (medidos nos pixels), arquivo `.lyr` com short, áudio do trecho
 
 ## Limitações conhecidas
 - Cada quadro é desenhado em Python: em 1080p o render é mais lento que o tempo real (VP9 com alpha é o mais lento).

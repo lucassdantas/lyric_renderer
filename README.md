@@ -32,6 +32,18 @@ Pra criar o atalho de novo (ex.: mudou a pasta de lugar): `python tools/create_s
 
 Pra próxima música: troque o áudio (o título acompanha), gere a legenda, confira e renderize.
 
+### Short (9:16)
+
+1. Clique em **📱 Short** no topo da coluna da esquerda.
+2. **Escolha o trecho** na barra que aparece em cima da legenda:
+   - digite início e fim (setinhas ±1s) e use **▶ Ouvir** pra conferir (toca só aquele pedaço), ou
+   - se a música já tem legenda, clique na primeira estrofe do refrão, **Shift+clique** na última e clique em **Usar estrofes marcadas**.
+3. **🎤 Gerar automática** no modo short ouve **só o trecho** e troca só as estrofes daquele pedaço (o resto da música fica).
+4. **Fundo**: arraste a imagem na prévia pra escolher a parte que aparece; roda do mouse dá zoom; **Centralizar** volta ao meio. A posição fica salva pros próximos shorts.
+5. **▶ Renderizar short** → sai um `.mp4` 1080×1920 com só aquele trecho (áudio com fade nas pontas).
+
+No short, cada estrofe é mostrada em telas de **2 versos** (ou 1, nas Configurações), com letra maior, e os efeitos vêm ligados: letra entrando de lado, transição entre versos, zoom lento no fundo e **karaokê** (a palavra cantada muda de cor — usa o tempo de cada palavra que a legenda automática guarda; em estrofe digitada à mão o tempo é estimado). Cada efeito dá pra desligar em ⚙ Configurações → Short. No vídeo normal os mesmos efeitos existem, mas vêm desligados.
+
 **⚙ Configurações** (fonte, tamanhos, cores, fundo sem imagem, fade, FPS, resolução) ficam numa janela separada e são lembradas entre uma vez e outra.
 
 Atalhos: `Ctrl+R` renderizar · `Ctrl+S` salvar projeto · `Ctrl+O` abrir projeto · `Ctrl+N` novo projeto.

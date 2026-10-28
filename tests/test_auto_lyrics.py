@@ -106,6 +106,35 @@ class GroupLinesTest(unittest.TestCase):
         self.assertLessEqual(res[-1].end, 10.0)
 
 
+class GenerateExcerptTest(unittest.TestCase):
+    """generate(start, end): only the excerpt is listened to, times stay song times."""
+
+    def test_excerpt_is_sliced_and_times_shifted(self):
+        from unittest import mock
+        import numpy as np
+        audio = np.zeros(al.SAMPLE_RATE * 60, dtype=np.float32)  # 60s song
+        heard = sung("eu caminhei sozinho", 1.0)                 # relative to the excerpt
+        with mock.patch.object(al, "load_audio", return_value=audio), \
+             mock.patch.object(al, "transcribe_words", return_value=heard) as tw:
+            res = al.generate("song.mp3", "Eu caminhei sozinho", start=20, end=30)
+        sliced = tw.call_args.args[0]
+        self.assertEqual(len(sliced), al.SAMPLE_RATE * 10)
+        self.assertAlmostEqual(res[0].start, 21.0 - al.PAD_BEFORE)
+        self.assertAlmostEqual(res[0].words[0].start, 21.0)
+
+    def test_too_short_excerpt(self):
+        from unittest import mock
+        import numpy as np
+        with mock.patch.object(al, "load_audio", return_value=np.zeros(al.SAMPLE_RATE * 5, np.float32)):
+            with self.assertRaises(al.AutoLyricsError):
+                al.generate("song.mp3", "", start=2, end=2.2)
+
+    def test_transcribe_mode_keeps_word_timing(self):
+        res = al.group_lines(sung("o sol nasceu", 1.0) + sung("eu caminhei", 8.0))
+        self.assertEqual([w.text for w in res[0].words], ["O", "sol", "nasceu"])
+        self.assertEqual(res[1].words[0].start, 8.0)
+
+
 class AlignLyricsTest(unittest.TestCase):
     LYRICS = ("[Verso]\nO sol nasceu na beira do mar\nE a cidade começou a acordar\n\n"
               "Eu caminhei sozinho pela praia\n\n"
@@ -148,6 +177,29 @@ class AlignLyricsTest(unittest.TestCase):
         self.assertTrue(res[0].text.startswith("[Verso]\n"))
         self.assertAlmostEqual(res[0].start, 3.0 - al.PAD_BEFORE)
         self.assertAlmostEqual(res[2].start, 25.0 - al.PAD_BEFORE)
+
+    def test_word_timing_for_karaoke(self):
+        words = (sung("o sol nasceu na veira do bar e a cidade comecou a acorda", 3.0)
+                 + sung("eu caminhei sozinho pela praia", 14.0)
+                 + sung("mas amanha e outro dia", 25.0))
+        res = al.align_lyrics(self.LYRICS, words, audio_end=40)
+        for s in res:  # one timed word per word shown
+            self.assertEqual([w.text for w in s.words], s.text.split())
+        first = res[0].words
+        self.assertEqual((first[0].text, first[0].start), ("O", 3.0))
+        # "beira"/"mar" weren't recognized ("veira"/"bar"): they get the time between neighbours
+        beira = next(w for w in first if w.text == "beira")
+        self.assertGreater(beira.start, first[3].start)
+        self.assertLess(beira.end, first[6].end + 0.01)
+        for a, b in zip(first, first[1:]):
+            self.assertLessEqual(a.start, b.start)
+
+    def test_kept_tags_get_a_time_too(self):
+        words = sung("O sol nasceu na beira do mar e a cidade começou a acordar", 3.0)
+        res = al.align_lyrics("[Verso]\nO sol nasceu na beira do mar\nE a cidade começou a acordar",
+                              words, audio_end=40, ignore_tags=False)
+        self.assertEqual(res[0].words[0].text, "[Verso]")
+        self.assertEqual(len(res[0].words), len(res[0].text.split()))
 
     def test_empty(self):
         self.assertEqual(al.align_lyrics("", sung("oi", 1)), [])

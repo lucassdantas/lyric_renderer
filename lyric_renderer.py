@@ -15,6 +15,7 @@ import threading
 import queue
 import re
 import functools
+import shutil
 import traceback
 from pathlib import Path
 from dataclasses import dataclass, field, asdict, replace
@@ -43,6 +44,10 @@ class Strophe:
     start_time: float   # seconds
     end_time: float     # seconds
     text: str
+    # [word, start, end] for each word of text.split(), when known (auto
+    # lyrics). Used for the karaoke effect and to split strophes into short
+    # screens; missing → estimated (see strophe_words).
+    words: List[list] = field(default_factory=list)
 
     def duration(self):
         return self.end_time - self.start_time
@@ -75,6 +80,31 @@ def _default_output_dir():
     return d
 
 
+SHORT_W, SHORT_H = 1080, 1920   # YouTube Shorts (9:16)
+
+
+@dataclass
+class ShortSettings:
+    """Everything that's specific to the vertical short (9:16)."""
+    clip_start: float = 0.0           # excerpt of the song (song time, seconds)
+    clip_end: float = 0.0
+    title_size: int = 84
+    lyric_size: int = 92
+    lines_per_screen: int = 2         # strophes are split into screens of N lines
+    fade_duration: float = 0.35
+    bg_x: float = 0.5                 # which part of the background shows (0–1, like
+    bg_y: float = 0.5                 # CSS object-position) and how much it's zoomed
+    bg_zoom: float = 1.0
+    fx_slide: bool = True             # effects: on by default only in shorts
+    fx_transition: bool = True
+    fx_zoom: bool = True
+    fx_karaoke: bool = True
+    karaoke_color: str = "#FFD54A"
+
+    def clip_duration(self) -> float:
+        return max(0.0, self.clip_end - self.clip_start)
+
+
 @dataclass
 class Project:
     title: str = "Título da Música"
@@ -95,6 +125,18 @@ class Project:
     strophes: List[Strophe] = field(default_factory=list)
     audio_file: str = ""
     output_file: str = ""
+    mode: str = "video"               # "video" (16:9) or "short" (9:16)
+    # Effects in the normal video (off by default; the short has its own)
+    fx_slide: bool = False
+    fx_transition: bool = False
+    fx_zoom: bool = False
+    fx_karaoke: bool = False
+    karaoke_color: str = "#FFD54A"
+    short: ShortSettings = field(default_factory=ShortSettings)
+
+    @property
+    def is_short(self) -> bool:
+        return self.mode == "short"
 
     def to_dict(self):
         d = asdict(self)
@@ -103,12 +145,15 @@ class Project:
     @classmethod
     def from_dict(cls, d):
         strophes_data = d.get("strophes", [])
+        short_data = d.get("short") or {}
         # Remove keys not in dataclass (forward compat)
-        valid = {f.name for f in Project.__dataclass_fields__.values()} - {"strophes"}
+        valid = {f.name for f in Project.__dataclass_fields__.values()} - {"strophes", "short"}
         proj = cls(**{k: v for k, v in d.items() if k in valid})
         s_valid = {f.name for f in Strophe.__dataclass_fields__.values()}
         proj.strophes = [Strophe(**{k: v for k, v in s.items() if k in s_valid})
                          for s in strophes_data]
+        sh_valid = {f.name for f in ShortSettings.__dataclass_fields__.values()}
+        proj.short = ShortSettings(**{k: v for k, v in short_data.items() if k in sh_valid})
         return proj
 
 
@@ -179,7 +224,13 @@ def title_from_filename(path: str) -> str:
 
 STYLE_FIELDS = ("title_font", "title_size", "lyric_font", "lyric_size", "line_spacing",
                 "fade_duration", "text_color", "title_color", "transparent_bg", "bg_color",
-                "video_width", "video_height", "fps")
+                "video_width", "video_height", "fps",
+                "fx_slide", "fx_transition", "fx_zoom", "fx_karaoke", "karaoke_color")
+# Short settings remembered between sessions (saved under cfg["short"]). The
+# background position is included: the same image is used for every short.
+SHORT_STYLE_FIELDS = ("title_size", "lyric_size", "lines_per_screen", "fade_duration",
+                      "fx_slide", "fx_transition", "fx_zoom", "fx_karaoke", "karaoke_color",
+                      "bg_x", "bg_y", "bg_zoom")
 
 
 def config_path() -> str:
@@ -213,20 +264,28 @@ def save_config(cfg: dict, path: Optional[str] = None):
 
 
 def style_of(project: "Project") -> dict:
-    return {f: getattr(project, f) for f in STYLE_FIELDS}
+    d = {f: getattr(project, f) for f in STYLE_FIELDS}
+    d["short"] = {f: getattr(project.short, f) for f in SHORT_STYLE_FIELDS}
+    return d
 
 
-def apply_style(project: "Project", cfg: dict):
-    """Copy saved style settings into the project, skipping wrong types."""
-    defaults = Project()
-    for f in STYLE_FIELDS:
+def _copy_typed(target, defaults, fields, cfg: dict):
+    for f in fields:
         if f not in cfg:
             continue
         value, default = cfg[f], getattr(defaults, f)
         if isinstance(default, float) and isinstance(value, int) and not isinstance(value, bool):
             value = float(value)
         if type(value) is type(default):
-            setattr(project, f, value)
+            setattr(target, f, value)
+
+
+def apply_style(project: "Project", cfg: dict):
+    """Copy saved style settings into the project, skipping wrong types."""
+    _copy_typed(project, Project(), STYLE_FIELDS, cfg)
+    short = cfg.get("short")
+    if isinstance(short, dict):
+        _copy_typed(project.short, ShortSettings(), SHORT_STYLE_FIELDS, short)
 
 
 _TIME_RE = r"\d{1,2}(?::\d{2}){1,2}(?:[.,]\d+)?"
@@ -283,11 +342,123 @@ def merge_with_next(strophes: List[Strophe], sid: int) -> List[Strophe]:
     if idx is None or idx + 1 >= len(ordered):
         return ordered
     a, b = ordered[idx], ordered[idx + 1]
+    words = [list(w) for w in strophe_words(a) + strophe_words(b)] \
+        if (a.words or b.words) else []
     merged = Strophe(id=a.id,
                      start_time=min(a.start_time, b.start_time),
                      end_time=max(a.end_time, b.end_time),
-                     text=a.text.strip() + "\n" + b.text.strip())
+                     text=a.text.strip() + "\n" + b.text.strip(),
+                     words=words)
     return ordered[:idx] + [merged] + ordered[idx + 2:]
+
+
+# ─────────────────────────────────────────────
+#  Word timing and short "screens"
+# ─────────────────────────────────────────────
+
+def estimate_words(tokens: List[str], start: float, end: float) -> List[tuple]:
+    """Spread words over a strophe proportionally to their length (used when
+    the real timing is unknown, e.g. strophes typed by hand)."""
+    if not tokens:
+        return []
+    dur = max(end - start, 0.01)
+    a = start + min(0.3, dur * 0.1)
+    b = end - min(0.4, dur * 0.1)
+    weights = [len(t) + 1 for t in tokens]
+    total = sum(weights)
+    out, t = [], a
+    for tok, w in zip(tokens, weights):
+        step = (b - a) * w / total
+        out.append((tok, t, t + step))
+        t += step
+    return out
+
+
+def strophe_words(s: Strophe) -> List[tuple]:
+    """(word, start, end) for every word of the strophe: the real timing from
+    auto lyrics when it matches the text, otherwise an estimate."""
+    tokens = s.text.split()
+    if s.words and len(s.words) == len(tokens):
+        return [(tok, float(w[1]), float(w[2])) for tok, w in zip(tokens, s.words)]
+    return estimate_words(tokens, s.start_time, s.end_time)
+
+
+def rescale_words(words: List[list], old: tuple, new: tuple) -> List[list]:
+    """Move word timings along when a strophe's start/end are edited."""
+    (a0, b0), (a1, b1) = old, new
+    if not words or b0 <= a0:
+        return []
+    k = (b1 - a1) / (b0 - a0)
+    return [[w[0], a1 + (w[1] - a0) * k, a1 + (w[2] - a0) * k] for w in words]
+
+
+@dataclass
+class Screen:
+    """What is on screen at once: some lines of one strophe."""
+    start: float
+    end: float
+    lines: List[List[tuple]]   # per line: [(word, start, end), ...]
+
+    @property
+    def text(self) -> str:
+        return "\n".join(" ".join(w[0] for w in line) for line in self.lines)
+
+
+def build_screens(strophes: List[Strophe], lines_per_screen: Optional[int] = None,
+                  fade: float = 0.35) -> List[Screen]:
+    """
+    Strophes → screens. With lines_per_screen, a 4-line strophe becomes two
+    2-line screens, each timed by its own words (first word start → last word
+    end, with room for the fade), so a short can show 1–2 big lines at a time.
+    """
+    screens = []
+    for s in sorted(strophes, key=lambda x: x.start_time):
+        words = strophe_words(s)
+        lines, k = [], 0
+        for line in s.text.split("\n"):
+            n = len(line.split())
+            if n:
+                lines.append(words[k:k + n])
+                k += n
+        if not lines:
+            continue
+        n_per = lines_per_screen or len(lines)
+        chunks = [lines[i:i + n_per] for i in range(0, len(lines), n_per)]
+        if len(chunks) == 1:
+            screens.append(Screen(s.start_time, s.end_time, lines))
+            continue
+        starts, ends = [s.start_time], []
+        for prev, nxt in zip(chunks, chunks[1:]):
+            last_end, first_start = prev[-1][-1][2], nxt[0][0][1]
+            if first_start - last_end >= 2 * fade:
+                # room for the fade-out after the last word and the fade-in
+                # before the next one
+                ends.append(last_end + fade)
+                starts.append(first_start - fade)
+            else:  # sung back to back: switch in the middle of the gap
+                mid = (last_end + first_start) / 2
+                ends.append(mid - 0.01)
+                starts.append(mid + 0.01)
+        ends.append(s.end_time)
+        for chunk, start, end in zip(chunks, starts, ends):
+            start = min(max(start, s.start_time), s.end_time)
+            end = min(max(end, start + 0.05), s.end_time)
+            screens.append(Screen(start, end, chunk))
+    return screens
+
+
+def cover_box(src_w: int, src_h: int, out_w: int, out_h: int,
+              pos_x: float = 0.5, pos_y: float = 0.5, zoom: float = 1.0) -> tuple:
+    """
+    Part of the source image (left, top, right, bottom) that fills out_w×out_h
+    without stretching ("cover"), zoomed in by `zoom`. pos_x/pos_y (0–1) say
+    which part shows: 0 = left/top edge, 1 = right/bottom edge.
+    """
+    scale = max(out_w / src_w, out_h / src_h) * max(zoom, 1.0)
+    cw, ch = out_w / scale, out_h / scale
+    left = (src_w - cw) * min(max(pos_x, 0.0), 1.0)
+    top = (src_h - ch) * min(max(pos_y, 0.0), 1.0)
+    return (left, top, left + cw, top + ch)
 
 
 def next_strophe_times(strophes):
@@ -397,8 +568,8 @@ def _load_background(path: str, mtime: float, w: int, h: int):
     return Image.open(path).convert("RGB").resize((w, h), Image.LANCZOS)
 
 
-def _draw_text_centered(draw, text: str, font, color, canvas_w: int, y: int):
-    """Draw text horizontally centered at y."""
+def _draw_text_centered(draw, text: str, font, color, canvas_w: int, y: int, dx: int = 0):
+    """Draw text horizontally centered at y (shifted by dx)."""
     try:
         bbox = font.getbbox(text)
         tw = bbox[2] - bbox[0]
@@ -406,7 +577,59 @@ def _draw_text_centered(draw, text: str, font, color, canvas_w: int, y: int):
     except Exception:
         tw = len(text) * 10
         tx = (canvas_w - tw) // 2
-    draw.text((tx, y), text, font=font, fill=color)
+    draw.text((tx + dx, y), text, font=font, fill=color)
+
+
+def _text_width(font, text: str) -> float:
+    try:
+        return font.getlength(text)
+    except Exception:
+        return len(text) * 10
+
+
+def wrap_words(words: list, font, max_w: float) -> List[list]:
+    """
+    Break a line (list of (word, start, end)) into lines that fit max_w,
+    balanced: "A felicidade / mora no comum" instead of leaving "comum" alone
+    on the last line. Lines that already fit are left untouched.
+    """
+    lines = _greedy_wrap(words, font, max_w)
+    if len(lines) < 2:
+        return lines
+    # narrowest width that still needs the same number of lines
+    lo, hi = max(_text_width(font, w[0]) for w in words), max_w
+    for _ in range(12):
+        mid = (lo + hi) / 2
+        if len(_greedy_wrap(words, font, mid)) > len(lines):
+            lo = mid
+        else:
+            hi = mid
+    return _greedy_wrap(words, font, hi)
+
+
+def _greedy_wrap(words: list, font, max_w: float) -> List[list]:
+    lines, cur, cur_w = [], [], 0.0
+    space = _text_width(font, " ")
+    for w in words:
+        ww = _text_width(font, w[0])
+        if cur and cur_w + space + ww > max_w:
+            lines.append(cur)
+            cur, cur_w = [w], ww
+        else:
+            cur_w = ww if not cur else cur_w + space + ww
+            cur.append(w)
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+@functools.lru_cache(maxsize=2)
+def _load_source(path: str, mtime: float, max_side: int):
+    """Background image as loaded (for cropping), shrunk if much bigger than needed."""
+    img = Image.open(path).convert("RGB")
+    if max(img.size) > max_side:
+        img.thumbnail((max_side, max_side), Image.LANCZOS)
+    return img
 
 
 def _subprocess_flags():
@@ -435,18 +658,28 @@ def final_output_path(output_path: str, transparent: bool) -> str:
 
 
 def project_is_transparent(project: Project) -> bool:
-    """Same rule as the renderer: a background image disables transparency."""
-    return project.transparent_bg and not (project.bg_image and os.path.isfile(project.bg_image))
+    """Same rule as the renderer: a background image disables transparency,
+    and shorts are never transparent (they're published as they are)."""
+    return (project.transparent_bg and not project.is_short
+            and not (project.bg_image and os.path.isfile(project.bg_image)))
+
+
+AUDIO_CLIP_FADE_IN = 0.15   # short excerpt: soft edges instead of a hard cut
+AUDIO_CLIP_FADE_OUT = 1.0
 
 
 def build_ffmpeg_cmd(output_path: str, width: int, height: int, fps: int,
-                     transparent: bool, audio_path: str = ""):
+                     transparent: bool, audio_path: str = "",
+                     audio_start: Optional[float] = None,
+                     audio_duration: Optional[float] = None):
     """
     Build the ffmpeg command for a raw-frame pipe on stdin.
     Returns (cmd, final_output_path).
     - Transparent → always WebM (VP9 + alpha)
     - .webm       → VP9 + Opus (WebM does not accept H.264/AAC)
     - otherwise   → H.264 + AAC
+    With audio_start/audio_duration only that excerpt of the audio is used
+    (shorts), faded in and out.
     """
     output_path = final_output_path(output_path, transparent)
     webm = Path(output_path).suffix.lower() == ".webm"
@@ -461,6 +694,9 @@ def build_ffmpeg_cmd(output_path: str, width: int, height: int, fps: int,
     ]
 
     has_audio = bool(audio_path and os.path.isfile(audio_path))
+    clip = has_audio and audio_duration is not None
+    if clip:
+        cmd += ["-ss", f"{max(audio_start or 0.0, 0.0):.3f}", "-t", f"{audio_duration:.3f}"]
     if has_audio:
         cmd += ["-i", audio_path]
 
@@ -481,6 +717,10 @@ def build_ffmpeg_cmd(output_path: str, width: int, height: int, fps: int,
         ]
 
     if has_audio:
+        if clip:
+            fade_out = min(AUDIO_CLIP_FADE_OUT, audio_duration / 3)
+            cmd += ["-af", f"afade=t=in:st=0:d={AUDIO_CLIP_FADE_IN},"
+                           f"afade=t=out:st={max(audio_duration - fade_out, 0):.3f}:d={fade_out:.3f}"]
         if webm:
             cmd += ["-c:a", "libopus", "-b:a", "192k"]
         else:
@@ -492,19 +732,57 @@ def build_ffmpeg_cmd(output_path: str, width: int, height: int, fps: int,
 
 
 class FrameRenderer:
-    def __init__(self, project: Project):
+    """
+    Draws the frames of the video (16:9) or of the short (9:16).
+
+    Timeline: frames are asked by *song time* t. The normal video starts at 0;
+    the short starts at short.clip_start (see render_video).
+    `scale` renders everything smaller (sizes and fonts), used by the preview.
+    """
+    SLIDE = 0.18      # effect: horizontal travel, fraction of the width
+    RISE = 0.05       # effect: vertical travel, fraction of the height
+    ZOOM = 0.08       # effect: background zooms in 8% over the whole video
+
+    def __init__(self, project: Project, scale: float = 1.0):
         self.proj = project
-        self.w = project.video_width
-        self.h = project.video_height
+        self.short = project.is_short
+        sh = project.short
+        if self.short:
+            self.w, self.h = int(SHORT_W * scale), int(SHORT_H * scale)
+            title_size, lyric_size, self.fade = sh.title_size, sh.lyric_size, sh.fade_duration
+            fx = sh
+            self.title_y, self.lyric_center, self.max_text_w = 0.11, 0.46, 0.84
+        else:
+            self.w, self.h = int(project.video_width * scale), int(project.video_height * scale)
+            title_size, lyric_size, self.fade = project.title_size, project.lyric_size, project.fade_duration
+            fx = project
+            self.title_y, self.lyric_center, self.max_text_w = 0.08, 0.5, 0.92
+        self.fx_slide, self.fx_transition = fx.fx_slide, fx.fx_transition
+        self.fx_zoom, self.fx_karaoke = fx.fx_zoom, fx.fx_karaoke
+        self.karaoke_rgb = hex_to_rgb(fx.karaoke_color)
+
         self.bg_rgb = hex_to_rgb(project.bg_color)
         self.text_rgb = hex_to_rgb(project.text_color)
         self.title_rgb = hex_to_rgb(project.title_color)
-        self.fade = project.fade_duration
         self.fps = project.fps
-        self.line_height = project.lyric_size + project.line_spacing + 6
+        title_size = max(1, round(title_size * scale))
+        lyric_size = max(1, round(lyric_size * scale))
+        self.line_height = lyric_size + round((project.line_spacing + 6) * scale)
+        self.title_line_height = round(title_size * 1.15)
         # Sort strophes by start time once
         self.strophes = sorted(project.strophes, key=lambda s: s.start_time)
         self.lyrics_end = max((s.end_time for s in self.strophes), default=0.0)
+        self.screens = build_screens(self.strophes, sh.lines_per_screen if self.short else None,
+                                     self.fade)
+
+        # Title is shown over the whole short, or from the first to the last
+        # strophe in the normal video
+        if self.short:
+            self.title_window = (sh.clip_start, sh.clip_end)
+        elif self.strophes:
+            self.title_window = (self.strophes[0].start_time, self.lyrics_end)
+        else:
+            self.title_window = (0.0, 0.0)
 
         # Font — try asset path first, then system search
         font_path = os.path.join(_default_assets_dir(), "fonts", "mvboli.ttf")
@@ -515,58 +793,100 @@ class FrameRenderer:
             tf_src = project.title_font
         if project.lyric_font not in ("mvboli", "MV Boli", ""):
             lf_src = project.lyric_font
-        self.title_font = find_font(tf_src, project.title_size)
-        self.lyric_font = find_font(lf_src, project.lyric_size)
+        self.title_font = find_font(tf_src, title_size)
+        self.lyric_font = find_font(lf_src, lyric_size)
+        self._title_lines = self._wrap_title()
 
-        # Background image (preloaded and resized once)
-        self._bg_img = None
+        # Background image. The normal video without zoom keeps the original
+        # behaviour (image resized to the frame); the short and the zoom effect
+        # crop it to fill the frame ("cover") at the chosen position.
+        self._bg_img = None      # static background, ready to use
+        self._bg_src = None      # source image, cropped every frame (zoom effect)
         if project.bg_image and os.path.isfile(project.bg_image):
             try:
-                self._bg_img = _load_background(project.bg_image,
-                                                os.path.getmtime(project.bg_image),
-                                                self.w, self.h)
+                mtime = os.path.getmtime(project.bg_image)
+                if self.short or self.fx_zoom:
+                    self._bg_src = _load_source(project.bg_image, mtime, 2 * max(self.w, self.h))
+                    if self.short:
+                        self._pos = (sh.bg_x, sh.bg_y, sh.bg_zoom)
+                    else:
+                        self._pos = (0.5, 0.5, 1.0)
+                    if not self.fx_zoom:
+                        self._bg_img = self._cover(self._pos[2])
+                        self._bg_src = None
+                else:
+                    self._bg_img = _load_background(project.bg_image, mtime, self.w, self.h)
             except Exception:
-                pass
+                self._bg_img = self._bg_src = None
 
         # Transparent mode: we work in RGBA and output rgba32 to ffmpeg
-        self._transparent = project.transparent_bg and not self._bg_img
+        has_bg = self._bg_img is not None or self._bg_src is not None
+        self._transparent = project.transparent_bg and not has_bg and not self.short
+
+    def _wrap_title(self) -> List[str]:
+        words = [(w, 0, 0) for w in self.proj.title.split()]
+        if not words:
+            return []
+        return [" ".join(w[0] for w in line)
+                for line in wrap_words(words, self.title_font, self.w * self.max_text_w)]
+
+    def _cover(self, zoom: float) -> Image.Image:
+        src = self._bg_src
+        box = cover_box(src.width, src.height, self.w, self.h, self._pos[0], self._pos[1], zoom)
+        return src.resize((self.w, self.h), Image.BILINEAR, box=box)
 
     # ── Alpha curve: smooth ease-in / ease-out ────────────
 
-    def _alpha(self, t: float, start: float, end: float) -> float:
-        """Returns 0.0–1.0 with smooth fade-in and fade-out."""
+    def _phase(self, t: float, start: float, end: float):
+        """(alpha, entering, leaving): alpha 0–1 with smooth fade-in/out;
+        entering/leaving go 0→1 while the text comes in / goes out."""
         if t <= start or t >= end:
-            return 0.0
+            return 0.0, 0.0, 0.0
         duration = end - start
         # Fade window is min(fade_setting, 30% of segment duration)
         fade = min(self.fade, duration * 0.30)
         if fade < 0.01:
-            return 1.0
+            return 1.0, 1.0, 0.0
         if t < start + fade:
             # ease-in: smoothstep
             x = (t - start) / fade
-            return x * x * (3 - 2 * x)
+            a = x * x * (3 - 2 * x)
+            return a, a, 0.0
         if t > end - fade:
             # ease-out: smoothstep
             x = (end - t) / fade
-            return x * x * (3 - 2 * x)
-        return 1.0
+            a = x * x * (3 - 2 * x)
+            return a, 1.0, 1.0 - a
+        return 1.0, 1.0, 0.0
+
+    def _alpha(self, t: float, start: float, end: float) -> float:
+        """Returns 0.0–1.0 with smooth fade-in and fade-out."""
+        return self._phase(t, start, end)[0]
 
     # ── Frame rendering ───────────────────────────────────
 
-    def _make_base_frame(self) -> Image.Image:
+    def _make_base_frame(self, t: float = 0.0) -> Image.Image:
         """Create the base canvas for a frame."""
         if self._transparent:
             # Fully transparent RGBA canvas
             return Image.new("RGBA", (self.w, self.h), (0, 0, 0, 0))
+        elif self._bg_src is not None:  # zoom effect: slowly closer over the video
+            a, b = self._zoom_window()
+            p = min(max((t - a) / (b - a), 0.0), 1.0) if b > a else 0.0
+            return self._cover(self._pos[2] * (1 + self.ZOOM * p)).convert("RGBA")
         elif self._bg_img:
             return self._bg_img.copy().convert("RGBA")
         else:
             return Image.new("RGBA", (self.w, self.h), (*self.bg_rgb, 255))
 
+    def _zoom_window(self):
+        if self.short:
+            return self.title_window
+        return 0.0, max(self.lyrics_end + 1.5, 1.0)
+
     def render_frame(self, t: float) -> Image.Image:
-        """Render one frame, return RGBA PIL Image."""
-        img = self._make_base_frame()
+        """Render one frame at song time t, return RGBA PIL Image."""
+        img = self._make_base_frame(t)
         # Draw on a separate RGBA overlay so alpha compositing is correct
         overlay = Image.new("RGBA", (self.w, self.h), (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
@@ -589,15 +909,16 @@ class FrameRenderer:
     # ── Draw helpers ──────────────────────────────────────
 
     def _draw_title(self, draw, t: float):
-        if not self.strophes:
+        if not self._title_lines:
             return
-        t0 = self.strophes[0].start_time
-        a = self._alpha(t, t0, self.lyrics_end)
+        a = self._alpha(t, *self.title_window)
         if a <= 0:
             return
         color = (*self.title_rgb, int(a * 255))
-        title_y = int(self.h * 0.08)
-        _draw_text_centered(draw, self.proj.title, self.title_font, color, self.w, title_y)
+        y = int(self.h * self.title_y)
+        for line in self._title_lines:
+            _draw_text_centered(draw, line, self.title_font, color, self.w, y)
+            y += self.title_line_height
 
     def active_strophe(self, t: float) -> Optional[Strophe]:
         """Strophe visible at time t (strictly inside, so back-to-back
@@ -607,25 +928,50 @@ class FrameRenderer:
                 return s
         return None
 
-    def _draw_lyric(self, draw, t: float):
-        active = self.active_strophe(t)
-        if active is None:
-            return
+    def active_screen(self, t: float) -> Optional[Screen]:
+        for sc in self.screens:
+            if sc.start < t < sc.end:
+                return sc
+        return None
 
-        a = self._alpha(t, active.start_time, active.end_time)
+    def _draw_lyric(self, draw, t: float):
+        sc = self.active_screen(t)
+        if sc is None:
+            return
+        a, entering, leaving = self._phase(t, sc.start, sc.end)
         if a <= 0:
             return
 
+        # Effects: slide in from the left / out to the right, and rise from
+        # below / leave upwards
+        dx = dy = 0
+        if self.fx_slide:
+            dx = int((-(1 - entering) + leaving) * self.SLIDE * self.w)
+        if self.fx_transition:
+            dy = int(((1 - entering) - leaving) * self.RISE * self.h)
+
         color = (*self.text_rgb, int(a * 255))
-        lines = active.text.strip().split("\n")
+        sung = (*self.karaoke_rgb, int(a * 255))
+        lines = []
+        for line in sc.lines:
+            lines += wrap_words(line, self.lyric_font, self.w * self.max_text_w)
 
         total_h = self.line_height * len(lines)
-        start_y = (self.h - total_h) // 2
+        start_y = (int(self.h * 2 * self.lyric_center) - total_h) // 2 + dy
 
-        for i, line in enumerate(lines):
-            if line.strip():
-                _draw_text_centered(draw, line, self.lyric_font, color, self.w,
-                                    start_y + i * self.line_height)
+        for i, words in enumerate(lines):
+            y = start_y + i * self.line_height
+            if not self.fx_karaoke:
+                _draw_text_centered(draw, " ".join(w[0] for w in words),
+                                    self.lyric_font, color, self.w, y, dx)
+                continue
+            # Karaoke: words already sung get the highlight color
+            space = _text_width(self.lyric_font, " ")
+            widths = [_text_width(self.lyric_font, w[0]) for w in words]
+            x = (self.w - (sum(widths) + space * (len(words) - 1))) / 2 + dx
+            for (word, ws, _we), ww in zip(words, widths):
+                draw.text((x, y), word, font=self.lyric_font, fill=sung if t >= ws else color)
+                x += ww + space
 
     # ── Main render ───────────────────────────────────────
 
@@ -634,21 +980,31 @@ class FrameRenderer:
         """
         Render all frames to video via ffmpeg pipe (see build_ffmpeg_cmd for
         the codec choice). The video lasts until the last strophe ends + 1.5s,
-        or until the audio ends, whichever is longer.
+        or until the audio ends, whichever is longer. A short is only the
+        excerpt short.clip_start → clip_end (video and audio).
         stderr drained in background thread to avoid Windows pipe deadlock.
         """
         if not self.strophes:
             return False, "Nenhuma estrofe adicionada."
 
         has_audio = bool(audio_path and os.path.isfile(audio_path))
-        duration = self.lyrics_end + 1.5
-        if has_audio:
-            duration = max(duration, probe_duration(audio_path))
+        clip_args = {}
+        if self.short:
+            sh = self.proj.short
+            offset, duration = sh.clip_start, sh.clip_duration()
+            if duration < 1:
+                return False, "Escolha o trecho do short (início e fim)."
+            clip_args = {"audio_start": offset, "audio_duration": duration}
+        else:
+            offset = 0.0
+            duration = self.lyrics_end + 1.5
+            if has_audio:
+                duration = max(duration, probe_duration(audio_path))
         total_frames = int(duration * self.fps)
 
         cmd, output_path = build_ffmpeg_cmd(
             output_path, self.w, self.h, self.fps, self._transparent,
-            audio_path if has_audio else "")
+            audio_path if has_audio else "", **clip_args)
 
         try:
             proc = subprocess.Popen(
@@ -694,7 +1050,7 @@ class FrameRenderer:
                     proc.wait()
                     return False, "Renderização cancelada."
 
-                frame = self.render_frame_bytes(i / self.fps)
+                frame = self.render_frame_bytes(offset + i / self.fps)
                 proc.stdin.write(frame)
 
                 if progress_callback and i % 15 == 0:
@@ -875,8 +1231,9 @@ class TimeEntry(tk.Frame):
     """
     _PASS_KEYS = {"Tab", "ISO_Left_Tab", "Return", "KP_Enter", "Escape"}
 
-    def __init__(self, parent, seconds: float = 0.0):
-        super().__init__(parent, bg=DARK["bg"])
+    def __init__(self, parent, seconds: float = 0.0, on_change=None, bg=None):
+        super().__init__(parent, bg=bg or DARK["bg"])
+        self.on_change = on_change  # called when the user changes the value
         self.var = tk.StringVar()
         self._digits = ""
         self._exact = None   # untouched value, keeps fractions from old projects
@@ -889,7 +1246,7 @@ class TimeEntry(tk.Frame):
                               font=("Consolas", 12), bd=4)
         self.entry.pack(side="left")
 
-        arrows = tk.Frame(self, bg=DARK["bg"])
+        arrows = tk.Frame(self, bg=self.cget("bg"))
         arrows.pack(side="left", padx=(2, 0), fill="y")
         for text, step in (("▲", 1), ("▼", -1)):
             tk.Button(arrows, text=text, command=lambda s=step: self.step(s),
@@ -943,6 +1300,8 @@ class TimeEntry(tk.Frame):
         self._digits = digits.lstrip("0")
         self._exact = None
         self._render()
+        if self.on_change:
+            self.on_change(float(time_digits_to_seconds(self._digits)))
 
     def _render(self):
         self.var.set(mask_time_digits(self._digits))
@@ -1149,6 +1508,27 @@ class SettingsPanel(tk.Frame):
                           highlightthickness=1, highlightbackground=DARK["border"],
                           highlightcolor=DARK["accent"])
 
+    FX = (("fx_slide", "Letra entrando de lado"),
+          ("fx_transition", "Transição entre versos (sobe e some)"),
+          ("fx_zoom", "Zoom lento no fundo"),
+          ("fx_karaoke", "Palavra cantada destacada (karaokê)"))
+
+    def _effects(self, parent, src) -> dict:
+        """Effect checkboxes + karaoke color for `src` (project or project.short)."""
+        out = {}
+        for key, label in self.FX:
+            var = tk.BooleanVar(value=getattr(src, key))
+            row = tk.Frame(parent, bg=DARK["surface"])
+            row.pack(fill="x", padx=16, pady=1)
+            tk.Checkbutton(row, text=label, variable=var, bg=DARK["surface"], fg=DARK["text"],
+                           activebackground=DARK["surface"], activeforeground=DARK["text"],
+                           selectcolor=DARK["entry_bg"], font=(UI_FONT, 9)).pack(side="left")
+            out[key] = var
+        out["karaoke_color"] = tk.StringVar(value=src.karaoke_color)
+        self._row(parent, "Cor do karaokê", lambda f: self._color_btn(f, out["karaoke_color"]),
+                  stretch=False)
+        return out
+
     def _color_btn(self, parent, var):
         from tkinter import colorchooser
         btn = tk.Button(parent, bg=var.get(), width=6, relief="flat", bd=0,
@@ -1231,6 +1611,25 @@ class SettingsPanel(tk.Frame):
             f, textvariable=self.res_var, values=["1920x1080", "1280x720", "3840x2160"],
             state="readonly", width=12, font=(UI_FONT, 10)))
 
+        # ── Effects of the normal video (off by default) ──
+        self._section("Efeitos no vídeo normal")
+        self.fx_vars = self._effects(inner, p)
+
+        # ── Short ──────────────────────────────────────────
+        sh = p.short
+        self._section("Short (9:16)")
+        self.short_title_size_var = tk.IntVar(value=sh.title_size)
+        self._row(inner, "Tamanho do título", lambda f: self._spin(f, self.short_title_size_var, 20, 200))
+        self.short_lyric_size_var = tk.IntVar(value=sh.lyric_size)
+        self._row(inner, "Tamanho da letra", lambda f: self._spin(f, self.short_lyric_size_var, 16, 200))
+        self.short_lines_var = tk.StringVar(value=str(sh.lines_per_screen))
+        self._row(inner, "Versos por tela", lambda f: ttk.Combobox(
+            f, textvariable=self.short_lines_var, values=["1", "2"], state="readonly", width=4,
+            font=(UI_FONT, 10)), stretch=False)
+        self.short_fade_var = tk.DoubleVar(value=sh.fade_duration)
+        self._row(inner, "Fade (segundos)", lambda f: self._spin(f, self.short_fade_var, 0.1, 2.0, 7, 0.05))
+        self.short_fx_vars = self._effects(inner, sh)
+
         tk.Frame(inner, bg=DARK["surface"], height=12).pack()
         self._on_transparent_toggle()  # set initial visibility
 
@@ -1256,6 +1655,14 @@ class SettingsPanel(tk.Frame):
         self.fade_var.set(p.fade_duration)
         self.fps_var.set(p.fps)
         self.res_var.set(f"{p.video_width}x{p.video_height}")
+        for src, fx_vars in ((p, self.fx_vars), (p.short, self.short_fx_vars)):
+            for key, var in fx_vars.items():
+                var.set(getattr(src, key))
+        sh = p.short
+        self.short_title_size_var.set(sh.title_size)
+        self.short_lyric_size_var.set(sh.lyric_size)
+        self.short_lines_var.set(str(sh.lines_per_screen))
+        self.short_fade_var.set(sh.fade_duration)
         self._on_transparent_toggle()
 
     def _apply(self) -> bool:
@@ -1266,7 +1673,13 @@ class SettingsPanel(tk.Frame):
             line_spacing = int(self.line_spacing_var.get())
             fade         = float(self.fade_var.get())
             fps          = int(self.fps_var.get())
-            if title_size <= 0 or lyric_size <= 0 or fps <= 0 or fade < 0 or line_spacing < 0:
+            short_title  = int(self.short_title_size_var.get())
+            short_lyric  = int(self.short_lyric_size_var.get())
+            short_fade   = float(self.short_fade_var.get())
+            short_lines  = int(self.short_lines_var.get())
+            if (title_size <= 0 or lyric_size <= 0 or fps <= 0 or fade < 0 or line_spacing < 0
+                    or short_title <= 0 or short_lyric <= 0 or short_fade < 0
+                    or short_lines not in (1, 2)):
                 raise ValueError
         except (tk.TclError, ValueError):
             messagebox.showerror("Configuração inválida",
@@ -1292,6 +1705,14 @@ class SettingsPanel(tk.Frame):
             w, h = res.split("x")
             p.video_width  = int(w)
             p.video_height = int(h)
+
+        for src, fx_vars in ((p, self.fx_vars), (p.short, self.short_fx_vars)):
+            for key, var in fx_vars.items():
+                setattr(src, key, var.get())
+        p.short.title_size = short_title
+        p.short.lyric_size = short_lyric
+        p.short.fade_duration = short_fade
+        p.short.lines_per_screen = short_lines
 
         if self.on_change:
             self.on_change()
@@ -1338,7 +1759,9 @@ class StropheList(tk.Frame):
         self.on_change = on_change
         self.on_auto_lyrics = on_auto_lyrics
         self.on_select = on_select
-        self.selected_id: Optional[int] = None
+        self.selected_id: Optional[int] = None   # the one shown in the preview
+        self.marked: set = set()                  # Shift+click range (short excerpt)
+        self.clip: Optional[tuple] = None         # short excerpt: dims strophes outside it
         self._cards = {}
         self._build()
 
@@ -1393,8 +1816,10 @@ class StropheList(tk.Frame):
         strophes = self.sorted_strophes()
         n = len(strophes)
         self.count_label.config(text=f"· {n} estrofe{'s' if n != 1 else ''}" if n else "")
-        if self.selected_id not in {s.id for s in strophes}:
+        ids = {s.id for s in strophes}
+        if self.selected_id not in ids:
             self.selected_id = strophes[0].id if strophes else None
+        self.marked &= ids
 
         if not strophes:
             tk.Label(self.scrollable_frame,
@@ -1407,15 +1832,42 @@ class StropheList(tk.Frame):
         for i, s in enumerate(strophes):
             self._strophe_card(self.scrollable_frame, s, i, is_last=i == n - 1)
 
-    def select(self, sid: Optional[int]):
-        self.selected_id = sid
-        for card_sid, card in self._cards.items():
-            card.config(highlightbackground=DARK["selected"] if card_sid == sid else DARK["surface"])
+    def select(self, sid: Optional[int], extend: bool = False):
+        """Click: select one strophe. Shift+click: mark the range from the
+        last clicked one (used to pick the short excerpt)."""
+        order = [s.id for s in self.sorted_strophes()]
+        if extend and self.selected_id in order and sid in order:
+            a, b = sorted((order.index(self.selected_id), order.index(sid)))
+            self.marked = set(order[a:b + 1])
+        else:
+            self.marked = {sid} if sid is not None else set()
+            self.selected_id = sid
+        self._paint_selection()
         if self.on_select:
-            self.on_select(sid)
+            self.on_select(self.selected_id)
+
+    def marked_strophes(self) -> List[Strophe]:
+        return [s for s in self.sorted_strophes() if s.id in self.marked]
+
+    def _paint_selection(self):
+        for card_sid, card in self._cards.items():
+            if card_sid == self.selected_id or card_sid in self.marked:
+                color = DARK["selected"]
+            else:
+                color = DARK["surface"]
+            card.config(highlightbackground=color)
+
+    def set_clip(self, clip: Optional[tuple]):
+        self.clip = clip
+        self.refresh()
+
+    def _in_clip(self, s: Strophe) -> bool:
+        return self.clip is None or (s.end_time > self.clip[0] and s.start_time < self.clip[1])
 
     def _strophe_card(self, parent, s: Strophe, idx: int, is_last: bool = False):
-        selected = s.id == self.selected_id
+        selected = s.id == self.selected_id or s.id in self.marked
+        inside = self._in_clip(s)
+        text_fg = DARK["text"] if inside else DARK["text_dim"]
         card = tk.Frame(parent, bg=DARK["surface"], highlightthickness=2,
                         highlightbackground=DARK["selected"] if selected else DARK["surface"],
                         cursor="hand2")
@@ -1423,7 +1875,8 @@ class StropheList(tk.Frame):
         self._cards[s.id] = card
 
         # Color accent strip
-        strip = tk.Frame(card, bg=DARK["accent"] if idx % 2 == 0 else DARK["accent2"], width=4)
+        strip_color = DARK["accent"] if idx % 2 == 0 else DARK["accent2"]
+        strip = tk.Frame(card, bg=strip_color if inside else DARK["surface2"], width=4)
         strip.pack(side="left", fill="y")
 
         inner = tk.Frame(card, bg=DARK["surface"])
@@ -1435,7 +1888,7 @@ class StropheList(tk.Frame):
 
         n_lines = len([l for l in s.text.split("\n") if l.strip()])
         time_str = (f"{format_time(s.start_time)}  →  {format_time(s.end_time)}")
-        tk.Label(top, text=time_str, bg=DARK["surface"], fg=DARK["text"],
+        tk.Label(top, text=time_str, bg=DARK["surface"], fg=text_fg,
                  font=("Consolas", 10, "bold")).pack(side="left")
         tk.Label(top, text=f"   {s.end_time - s.start_time:.1f}s · "
                            f"{n_lines} linha{'s' if n_lines != 1 else ''}",
@@ -1453,7 +1906,7 @@ class StropheList(tk.Frame):
                          font=(UI_FONT, 9)).pack(side="right", padx=(0, 4))
 
         # Lyrics
-        tk.Label(inner, text=s.text.strip(), bg=DARK["surface"], fg=DARK["text"],
+        tk.Label(inner, text=s.text.strip(), bg=DARK["surface"], fg=text_fg,
                  font=(UI_FONT, 10), anchor="w", justify="left",
                  wraplength=560).pack(fill="x", pady=(6, 0))
 
@@ -1461,6 +1914,7 @@ class StropheList(tk.Frame):
         def bind_select(w):
             if not isinstance(w, tk.Button):
                 w.bind("<Button-1>", lambda e, sid=s.id: self.select(sid))
+                w.bind("<Shift-Button-1>", lambda e, sid=s.id: self.select(sid, extend=True))
                 w.bind("<Double-Button-1>", lambda e, sid=s.id: self._edit(sid))
             for child in w.winfo_children():
                 bind_select(child)
@@ -1490,6 +1944,9 @@ class StropheList(tk.Frame):
 
         def on_save(new_s: Strophe):
             new_s.id = sid
+            if new_s.text == s.text and s.words:  # same text: move the words along
+                new_s.words = rescale_words(s.words, (s.start_time, s.end_time),
+                                            (new_s.start_time, new_s.end_time))
             idx = next(i for i, x in enumerate(self.project.strophes) if x.id == sid)
             self.project.strophes[idx] = new_s
             self._changed()
@@ -1601,9 +2058,12 @@ class AutoLyricsDialog(WorkerMixin, tk.Toplevel):
     LANGUAGES = {"Português": "pt", "Inglês": "en", "Espanhol": "es", "Detectar": None}
 
     def __init__(self, parent, project: Project, options: Optional[dict] = None,
-                 on_options=None, on_done=None, ask_before_replace: bool = True):
+                 on_options=None, on_done=None, ask_before_replace: bool = True,
+                 clip: Optional[tuple] = None):
         super().__init__(parent)
         self.project = project
+        # Short: only this excerpt (song time) is listened to and replaced
+        self.clip = clip
         self.options = options or {}
         self.on_options = on_options
         self.on_done = on_done
@@ -1622,7 +2082,9 @@ class AutoLyricsDialog(WorkerMixin, tk.Toplevel):
         pad = {"padx": 20}
         tk.Label(self, text="🎤  Gerar legenda automática", bg=DARK["bg"], fg=DARK["text"],
                  font=(UI_FONT, 13, "bold")).pack(anchor="w", pady=(16, 2), **pad)
-        tk.Label(self, text=f"Música: {os.path.basename(self.project.audio_file)}",
+        where = (f"   ·   só o trecho {format_time(self.clip[0])} → {format_time(self.clip[1])}"
+                 if self.clip else "")
+        tk.Label(self, text=f"Música: {os.path.basename(self.project.audio_file)}{where}",
                  bg=DARK["bg"], fg=DARK["text_dim"], font=(UI_FONT, 9)).pack(anchor="w", **pad)
 
         # Options
@@ -1739,10 +2201,12 @@ class AutoLyricsDialog(WorkerMixin, tk.Toplevel):
 
         def run():
             try:
+                clip = self.clip or (None, None)
                 result = auto_lyrics.generate(audio, lyrics, model, language,
                                               progress=progress,
                                               cancel=lambda: self.cancelled,
-                                              ignore_tags=ignore_tags)
+                                              ignore_tags=ignore_tags,
+                                              start=clip[0], end=clip[1])
                 outcome = (True, result)
             except auto_lyrics.Cancelled:
                 return
@@ -1784,15 +2248,25 @@ class AutoLyricsDialog(WorkerMixin, tk.Toplevel):
             self._reset_buttons()
             messagebox.showwarning("Nada encontrado", "Nenhuma estrofe foi gerada.", parent=self)
             return
-        if self.ask_before_replace and self.project.strophes and not messagebox.askyesno(
+        # With an excerpt, only the strophes inside it are replaced
+        if self.clip:
+            a, b = self.clip
+            replaced = [s for s in self.project.strophes if s.end_time > a and s.start_time < b]
+        else:
+            replaced = list(self.project.strophes)
+        if self.ask_before_replace and replaced and not messagebox.askyesno(
                 "Substituir estrofes?",
-                f"O projeto já tem {len(self.project.strophes)} estrofe(s).\n"
+                f"{'O trecho' if self.clip else 'O projeto'} já tem {len(replaced)} estrofe(s).\n"
                 f"Substituir pelas {len(result)} geradas?", parent=self):
             self._reset_buttons()
             return
 
-        self.project.strophes = [Strophe(id=i + 1, start_time=s.start, end_time=s.end, text=s.text)
-                                 for i, s in enumerate(result)]
+        kept = [s for s in self.project.strophes if not any(s is r for r in replaced)]
+        next_id = max((s.id for s in kept), default=0) + 1
+        new = [Strophe(id=next_id + i, start_time=s.start, end_time=s.end, text=s.text,
+                       words=[[w.text, round(w.start, 3), round(w.end, 3)] for w in s.words])
+               for i, s in enumerate(result)]
+        self.project.strophes = sorted(kept + new, key=lambda s: s.start_time)
         if self.on_done:
             self.on_done()
         messagebox.showinfo("Pronto",
@@ -1899,25 +2373,52 @@ class RenderDialog(WorkerMixin, tk.Toplevel):
 
 
 class SongPanel(tk.Frame):
-    """Left column: audio, title, background, the preview and the render button."""
-    PREVIEW_W, PREVIEW_H = 400, 225
+    """Left column: video/short switch, audio, title, background, the preview
+    and the render button. In short mode the preview is vertical and the
+    background can be dragged (position) and scrolled (zoom)."""
+    PREVIEW_W, PREVIEW_H = 400, 225              # 16:9
+    SHORT_PREVIEW_W, SHORT_PREVIEW_H = 144, 256  # 9:16
     THUMB_W, THUMB_H = 96, 54
 
     def __init__(self, parent, on_pick_audio=None, on_title_change=None, on_pick_bg=None,
-                 on_clear_bg=None, on_render=None):
+                 on_clear_bg=None, on_render=None, on_mode=None, on_drag_bg=None,
+                 on_zoom_bg=None, on_center_bg=None):
         super().__init__(parent, bg=DARK["bg"])
         self.on_title_change = on_title_change
+        self.on_drag_bg, self.on_zoom_bg = on_drag_bg, on_zoom_bg
+        self.mode = "video"
         self._suspend_title_cb = False
         self._thumb = self._preview = None
+        self._drag_from = None
         # Label sizes are in characters unless they hold an image: blank
         # images keep the boxes at a fixed pixel size while empty
         self._blank_thumb = tk.PhotoImage(master=self, width=self.THUMB_W, height=self.THUMB_H)
-        self._blank_preview = tk.PhotoImage(master=self, width=self.PREVIEW_W, height=self.PREVIEW_H)
+        self._blank = {
+            "video": tk.PhotoImage(master=self, width=self.PREVIEW_W, height=self.PREVIEW_H),
+            "short": tk.PhotoImage(master=self, width=self.SHORT_PREVIEW_W,
+                                   height=self.SHORT_PREVIEW_H),
+        }
+
+        # ── Render (packed first: never squeezed out when space is short) ──
+        self.render_btn = StyledButton(self, "▶   Renderizar vídeo", command=on_render,
+                                       font=(UI_FONT, 12, "bold"), pady=12)
+        self.render_btn.pack(fill="x", side="bottom", pady=(12, 0))
+
+        # ── Video / Short switch ───────────────────────
+        switch = tk.Frame(self, bg=DARK["surface"], padx=4, pady=4)
+        switch.pack(fill="x", pady=(0, 10))
+        self.mode_btns = {}
+        for mode, text in (("video", "🎬  Vídeo  16:9"), ("short", "📱  Short  9:16")):
+            b = tk.Button(switch, text=text, relief="flat", bd=0, cursor="hand2",
+                          font=(UI_FONT, 10, "bold"), pady=6, highlightthickness=0,
+                          command=lambda m=mode: on_mode and on_mode(m))
+            b.pack(side="left", fill="x", expand=True, padx=2)
+            self.mode_btns[mode] = b
 
         # ── Song card ──────────────────────────────────
-        card = tk.Frame(self, bg=DARK["surface"], padx=16, pady=14)
+        card = tk.Frame(self, bg=DARK["surface"], padx=16, pady=12)
         card.pack(fill="x")
-        section_title(card, "Música", DARK["surface"]).pack(anchor="w", pady=(0, 8))
+        section_title(card, "Música", DARK["surface"]).pack(anchor="w", pady=(0, 6))
 
         def row(label):
             r = tk.Frame(card, bg=DARK["surface"])
@@ -1958,21 +2459,54 @@ class SongPanel(tk.Frame):
         self.bg_clear_btn.pack(side="left", padx=(6, 0))
 
         # ── Preview card ───────────────────────────────
-        pcard = tk.Frame(self, bg=DARK["surface"], padx=16, pady=14)
-        pcard.pack(fill="x", pady=(12, 0))
+        pcard = tk.Frame(self, bg=DARK["surface"], padx=16, pady=12)
+        pcard.pack(fill="x", pady=(10, 0))
         section_title(pcard, "Prévia", DARK["surface"]).pack(anchor="w", pady=(0, 8))
-        self.preview_label = tk.Label(pcard, bg="#000000", image=self._blank_preview, bd=0)
+        self.preview_label = tk.Label(pcard, bg="#000000", image=self._blank["video"], bd=0)
         self.preview_label.pack()
+        self.preview_label.bind("<ButtonPress-1>", self._drag_start)
+        self.preview_label.bind("<B1-Motion>", self._drag_move)
+        self.preview_label.bind("<ButtonRelease-1>", lambda e: setattr(self, "_drag_from", None))
+        self.preview_label.bind("<MouseWheel>", self._wheel)
+        self.preview_label.bind("<Button-4>", lambda e: self._zoom(1))
+        self.preview_label.bind("<Button-5>", lambda e: self._zoom(-1))
+        # short only: how to position the background
+        self.preview_hint = tk.Frame(pcard, bg=DARK["surface"])
+        tk.Label(self.preview_hint, text="Arraste pra posicionar · roda do mouse = zoom",
+                 bg=DARK["surface"], fg=DARK["text_dim"], font=(UI_FONT, 8)).pack(side="left")
+        self.center_btn = StyledButton(self.preview_hint, "Centralizar", command=on_center_bg,
+                                       style="ghost", padx=8, pady=1, font=(UI_FONT, 8))
+        self.center_btn.pack(side="right")
         self.preview_caption = tk.Label(pcard, text="", bg=DARK["surface"], fg=DARK["text_dim"],
-                                        font=(UI_FONT, 9))
-        self.preview_caption.pack(anchor="w", pady=(8, 0))
+                                        font=(UI_FONT, 9), wraplength=400, justify="left")
+        self.preview_caption.pack(anchor="w", pady=(4, 0))
 
-        # ── Render ─────────────────────────────────────
-        self.render_btn = StyledButton(self, "▶   Renderizar vídeo", command=on_render,
-                                       font=(UI_FONT, 12, "bold"), pady=12)
-        self.render_btn.pack(fill="x", side="bottom", pady=(12, 0))
+        self.set_mode("video")
 
     # ── Setters (called by App) ─────────────────────────
+
+    def set_mode(self, mode: str):
+        self.mode = mode
+        for m, b in self.mode_btns.items():
+            on = m == mode
+            b.config(bg=DARK["accent"] if on else DARK["surface"],
+                     fg="#fff" if on else DARK["text_dim"],
+                     activebackground=DARK["accent"] if on else DARK["surface2"],
+                     activeforeground="#fff")
+        short = mode == "short"
+        self.render_btn.config(text="▶   Renderizar short" if short else "▶   Renderizar vídeo")
+        self.preview_label.config(cursor="fleur" if short else "")
+        if short:
+            self.preview_hint.pack(fill="x", before=self.preview_caption, pady=(4, 0))
+        else:
+            self.preview_hint.pack_forget()
+        if self._preview is None:
+            self.preview_label.config(image=self._blank[mode])
+
+    def preview_size(self) -> tuple:
+        if self.mode == "short":
+            return self.SHORT_PREVIEW_W, self.SHORT_PREVIEW_H
+        return self.PREVIEW_W, self.PREVIEW_H
 
     def set_audio(self, path: str):
         self.audio_label.config(text=os.path.basename(path) if path else "Nenhum áudio escolhido",
@@ -2006,8 +2540,78 @@ class SongPanel(tk.Frame):
 
     def show_preview(self, img, caption: str):
         self._preview = ImageTk.PhotoImage(img, master=self) if img is not None else None
-        self.preview_label.config(image=self._preview or self._blank_preview)
+        self.preview_label.config(image=self._preview or self._blank[self.mode])
         self.preview_caption.config(text=caption)
+
+    # ── Background positioning (short) ──────────────────
+
+    def _drag_start(self, e):
+        self._drag_from = (e.x, e.y) if self.mode == "short" else None
+
+    def _drag_move(self, e):
+        if self._drag_from is None or not self.on_drag_bg:
+            return
+        w, h = self.preview_size()
+        dx, dy = (e.x - self._drag_from[0]) / w, (e.y - self._drag_from[1]) / h
+        self._drag_from = (e.x, e.y)
+        self.on_drag_bg(dx, dy)
+
+    def _wheel(self, e):
+        self._zoom(1 if e.delta > 0 else -1)
+
+    def _zoom(self, steps: int):
+        if self.mode == "short" and self.on_zoom_bg:
+            self.on_zoom_bg(steps)
+
+
+class ClipBar(tk.Frame):
+    """Short mode: which part of the song becomes the short."""
+
+    def __init__(self, parent, on_change=None, on_play=None, on_use_selection=None):
+        super().__init__(parent, bg=DARK["surface"], padx=14, pady=10)
+        self.on_change = on_change
+        section_title(self, "Trecho do short", DARK["surface"]).pack(side="left", padx=(0, 12))
+        self.start_entry = TimeEntry(self, 0, on_change=lambda v: self._changed(), bg=DARK["surface"])
+        self.start_entry.pack(side="left")
+        tk.Label(self, text="→", bg=DARK["surface"], fg=DARK["text_dim"],
+                 font=(UI_FONT, 11)).pack(side="left", padx=6)
+        self.end_entry = TimeEntry(self, 0, on_change=lambda v: self._changed(), bg=DARK["surface"])
+        self.end_entry.pack(side="left")
+        self.duration_label = tk.Label(self, text="", bg=DARK["surface"], fg=DARK["text_dim"],
+                                       font=(UI_FONT, 9))
+        self.duration_label.pack(side="left", padx=(10, 0))
+
+        StyledButton(self, "Usar estrofes marcadas", command=on_use_selection, style="secondary",
+                     padx=10, pady=4, font=(UI_FONT, 9)).pack(side="right")
+        self.play_btn = StyledButton(self, "▶ Ouvir", command=on_play, style="secondary",
+                                     padx=10, pady=4, font=(UI_FONT, 9))
+        self.play_btn.pack(side="right", padx=(0, 6))
+
+    def set_clip(self, start: float, end: float):
+        self.start_entry.set_seconds(start)
+        self.end_entry.set_seconds(end)
+        self._show_duration()
+
+    def get_clip(self) -> tuple:
+        return self.start_entry.get_seconds(), self.end_entry.get_seconds()
+
+    def _changed(self):
+        self._show_duration()
+        if self.on_change:
+            self.on_change(*self.get_clip())
+
+    def _show_duration(self):
+        a, b = self.get_clip()
+        if b > a:
+            d = b - a
+            warn = "  (Shorts: até 3 min)" if d > 180 else ""
+            self.duration_label.config(text=f"{d:.0f}s{warn}",
+                                       fg=DARK["accent"] if warn else DARK["text_dim"])
+        else:
+            self.duration_label.config(text="escolha início e fim", fg=DARK["accent"])
+
+    def set_playing(self, playing: bool):
+        self.play_btn.config(text="⏹ Parar" if playing else "▶ Ouvir")
 
 
 def _checkerboard(w: int, h: int, size: int = 10):
@@ -2024,10 +2628,23 @@ def render_preview(project: Project, text: str, w: int, h: int):
     """
     How a strophe looks in the video (title + text over the background),
     scaled to w×h. Transparent backgrounds are shown over a checkerboard.
+    The short is drawn directly at preview size (fast enough to follow the
+    mouse while the background is dragged); with karaoke on, half of the
+    words show as already sung.
     """
-    p = replace(project, strophes=[Strophe(0, 0.0, 10.0, text or " ")], fade_duration=0.0)
-    renderer = FrameRenderer(p)
-    frame = renderer.render_frame(5.0).resize((w, h), Image.LANCZOS)
+    strophes = [Strophe(0, 0.0, 10.0, text or " ")]
+    if project.is_short:
+        short = replace(project.short, clip_start=0.0, clip_end=10.0, fade_duration=0.0,
+                        lines_per_screen=99)
+        p = replace(project, strophes=strophes, short=short)
+        renderer = FrameRenderer(p, scale=w / SHORT_W)
+        frame = renderer.render_frame(5.0)
+        if frame.size != (w, h):
+            frame = frame.resize((w, h), Image.LANCZOS)
+    else:
+        p = replace(project, strophes=strophes, fade_duration=0.0)
+        renderer = FrameRenderer(p)
+        frame = renderer.render_frame(5.0).resize((w, h), Image.LANCZOS)
     if renderer._transparent:
         frame = Image.alpha_composite(_checkerboard(w, h), frame)
     return frame.convert("RGB")
@@ -2047,6 +2664,9 @@ class App(tk.Tk):
         self._current_file = None
         self._lyrics_audio = None   # audio the current strophes were made for
         self._preview_job = None
+        self._cfg_job = None
+        self._player = None         # ffplay process of "▶ Ouvir"
+        self._bg_sizes = {}
 
         self._set_icon()
         self._setup_styles()
@@ -2058,12 +2678,14 @@ class App(tk.Tk):
     # ── Setup ─────────────────────────────────
 
     def _fresh_project(self) -> Project:
-        """New project with the saved style and the last background image."""
+        """New project with the saved style, the last background image and mode."""
         p = Project(title="")
         apply_style(p, self.cfg)
         bg = self.cfg.get("bg_image", "")
         if isinstance(bg, str) and bg and os.path.isfile(bg):
             p.bg_image = bg
+        if self.cfg.get("mode") in ("video", "short"):
+            p.mode = self.cfg["mode"]
         return p
 
     def _save_cfg(self, **changes):
@@ -2132,21 +2754,27 @@ class App(tk.Tk):
                                   font=(UI_FONT, 8), anchor="w", padx=16, pady=5)
         self.statusbar.pack(fill="x", side="bottom")
 
-        # Body: song panel | strophes
+        # Body: song panel | (short excerpt) + strophes
         body = tk.Frame(self, bg=DARK["bg"])
         body.pack(fill="both", expand=True, padx=16, pady=16)
 
         self.song = SongPanel(body, on_pick_audio=self._pick_audio,
                               on_title_change=self._title_changed,
                               on_pick_bg=self._pick_bg, on_clear_bg=self._clear_bg,
-                              on_render=self._render)
+                              on_render=self._render, on_mode=self.set_mode,
+                              on_drag_bg=self._drag_bg, on_zoom_bg=self._zoom_bg,
+                              on_center_bg=self._center_bg)
         self.song.pack(side="left", fill="y")
 
-        self.strophe_list = StropheList(body, self.project,
+        right = tk.Frame(body, bg=DARK["bg"])
+        right.pack(side="left", fill="both", expand=True, padx=(16, 0))
+        self.clip_bar = ClipBar(right, on_change=self._clip_changed, on_play=self._toggle_play,
+                                on_use_selection=self._use_marked_as_clip)
+        self.strophe_list = StropheList(right, self.project,
                                         on_change=self._on_project_change,
                                         on_auto_lyrics=self._auto_lyrics,
                                         on_select=lambda sid: self._schedule_preview())
-        self.strophe_list.pack(side="left", fill="both", expand=True, padx=(16, 0))
+        self.strophe_list.pack(fill="both", expand=True)
 
     def _bind_keys(self):
         for key, fn in (("s", self._save_project), ("r", self._render),
@@ -2167,6 +2795,10 @@ class App(tk.Tk):
         messagebox.showerror("Erro inesperado",
                              f"{val}\n\nDetalhes salvos em:\n{log}" if log else str(val))
 
+    def destroy(self):
+        self._stop_play()
+        super().destroy()
+
     # ── Song panel ────────────────────────────
 
     def _sync_song_panel(self):
@@ -2174,12 +2806,16 @@ class App(tk.Tk):
         self.song.set_audio(p.audio_file)
         self.song.set_title(p.title)
         self._sync_background()
+        self._sync_mode()
 
     def _sync_background(self):
         p = self.project
         bg = p.bg_image if p.bg_image and os.path.isfile(p.bg_image) else ""
-        hint = ("Sem imagem: fundo transparente (.webm)" if p.transparent_bg
-                else "Sem imagem: fundo de cor sólida")
+        if p.is_short:
+            hint = "Sem imagem: fundo de cor sólida"
+        else:
+            hint = ("Sem imagem: fundo transparente (.webm)" if p.transparent_bg
+                    else "Sem imagem: fundo de cor sólida")
         self.song.set_background(bg, hint)
 
     def _pick_audio(self):
@@ -2192,6 +2828,7 @@ class App(tk.Tk):
 
     def set_audio(self, path: str):
         """New song: remember the audio and fill the title from the file name."""
+        self._stop_play()
         self.project.audio_file = path
         self.song.set_audio(path)
         self.song.set_title(title_from_filename(path))
@@ -2221,6 +2858,145 @@ class App(tk.Tk):
     def _clear_bg(self):
         self.set_background("")
 
+    # ── Video / short ─────────────────────────
+
+    def set_mode(self, mode: str):
+        if mode == self.project.mode:
+            return
+        self.project.mode = mode
+        self._save_cfg(mode=mode)
+        self._sync_mode()
+        self._sync_background()
+        self._on_project_change()
+
+    def _sync_mode(self):
+        p = self.project
+        self.song.set_mode(p.mode)
+        if p.is_short:
+            self.clip_bar.pack(fill="x", pady=(0, 12), before=self.strophe_list)
+            self.clip_bar.set_clip(p.short.clip_start, p.short.clip_end)
+            self.strophe_list.set_clip(self._clip())
+        else:
+            self._stop_play()
+            self.clip_bar.pack_forget()
+            self.strophe_list.set_clip(None)
+
+    def _clip(self) -> Optional[tuple]:
+        """The short excerpt, if one was chosen."""
+        sh = self.project.short
+        return (sh.clip_start, sh.clip_end) if sh.clip_end - sh.clip_start >= 1 else None
+
+    def _clip_changed(self, start: float, end: float):
+        self.project.short.clip_start, self.project.short.clip_end = start, end
+        self.strophe_list.set_clip(self._clip())
+        self._on_project_change()
+
+    def _use_marked_as_clip(self):
+        marked = self.strophe_list.marked_strophes()
+        if not marked:
+            messagebox.showinfo("Marque as estrofes",
+                                "Clique na primeira estrofe do trecho e Shift+clique na última.",
+                                parent=self)
+            return
+        start = max(0.0, marked[0].start_time - 0.3)
+        end = max(s.end_time for s in marked) + 0.5
+        self.clip_bar.set_clip(start, end)
+        self._clip_changed(start, end)
+
+    def _toggle_play(self):
+        """▶ Ouvir: plays only the excerpt with ffplay (comes with FFmpeg)."""
+        if self._player and self._player.poll() is None:
+            self._stop_play()
+            return
+        p, clip = self.project, self._clip()
+        if not p.audio_file or not os.path.isfile(p.audio_file):
+            messagebox.showinfo("Escolha o áudio", "Escolha o áudio da música primeiro.", parent=self)
+            return
+        if not clip:
+            messagebox.showinfo("Trecho", "Escolha o início e o fim do trecho.", parent=self)
+            return
+        ffplay = shutil.which("ffplay")
+        if not ffplay:
+            messagebox.showerror("ffplay não encontrado",
+                                 "O ▶ Ouvir usa o ffplay, que vem junto com o FFmpeg "
+                                 "(na mesma pasta 'bin').", parent=self)
+            return
+        try:
+            self._player = subprocess.Popen(
+                [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet",
+                 "-ss", f"{clip[0]:.2f}", "-t", f"{clip[1] - clip[0]:.2f}", p.audio_file],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=_subprocess_flags())
+        except OSError as e:
+            messagebox.showerror("Erro", f"Não foi possível tocar o trecho:\n{e}", parent=self)
+            return
+        self.clip_bar.set_playing(True)
+        self.after(300, self._poll_player)
+
+    def _poll_player(self):
+        if self._player and self._player.poll() is None:
+            self.after(300, self._poll_player)
+        else:
+            self._player = None
+            self.clip_bar.set_playing(False)
+
+    def _stop_play(self):
+        if self._player and self._player.poll() is None:
+            self._player.terminate()
+        self._player = None
+        try:
+            self.clip_bar.set_playing(False)
+        except (AttributeError, tk.TclError):
+            pass
+
+    # Background position in the short (drag / wheel on the preview)
+
+    def _bg_size(self) -> Optional[tuple]:
+        path = self.project.bg_image
+        if not (path and os.path.isfile(path) and HAS_PIL):
+            return None
+        if path not in self._bg_sizes:
+            try:
+                with Image.open(path) as im:
+                    self._bg_sizes[path] = im.size
+            except Exception:
+                return None
+        return self._bg_sizes[path]
+
+    def _drag_bg(self, dx: float, dy: float):
+        """dx/dy: mouse movement as a fraction of the preview size."""
+        size = self._bg_size()
+        if not size:
+            return
+        sh = self.project.short
+        sw, shh = size
+        left, top, right, bottom = cover_box(sw, shh, SHORT_W, SHORT_H, sh.bg_x, sh.bg_y, sh.bg_zoom)
+        cw, ch = right - left, bottom - top
+        # the image follows the mouse: moving right shows more of the left side
+        if sw - cw > 1:
+            sh.bg_x = min(max(sh.bg_x - dx * cw / (sw - cw), 0.0), 1.0)
+        if shh - ch > 1:
+            sh.bg_y = min(max(sh.bg_y - dy * ch / (shh - ch), 0.0), 1.0)
+        self._bg_moved()
+
+    def _zoom_bg(self, steps: int):
+        sh = self.project.short
+        sh.bg_zoom = min(max(sh.bg_zoom * (1.08 ** steps), 1.0), 3.0)
+        self._bg_moved()
+
+    def _center_bg(self):
+        sh = self.project.short
+        sh.bg_x = sh.bg_y = 0.5
+        sh.bg_zoom = 1.0
+        self._bg_moved()
+
+    def _bg_moved(self):
+        self._schedule_preview(delay=15)
+        # remembered for the next shorts (same background image every time)
+        if self._cfg_job:
+            self.after_cancel(self._cfg_job)
+        self._cfg_job = self.after(500, lambda: self._save_cfg(short=style_of(self.project)["short"]))
+
     # ── Settings / preview / status ────────────
 
     def _open_settings(self):
@@ -2236,15 +3012,20 @@ class App(tk.Tk):
         n = len(p.strophes)
         name = os.path.basename(self._current_file) if self._current_file else "projeto não salvo"
         end = max((s.end_time for s in p.strophes), default=0)
-        self.statusbar.config(
-            text=f"{name}   ·   {n} estrofe{'s' if n != 1 else ''}"
-                 + (f"   ·   legenda até {format_time(end)}" if n else ""))
+        text = f"{name}   ·   {n} estrofe{'s' if n != 1 else ''}"
+        if p.is_short:
+            clip = self._clip()
+            text += (f"   ·   short: {format_time(clip[0])} → {format_time(clip[1])} "
+                     f"({clip[1] - clip[0]:.0f}s)" if clip else "   ·   short: escolha o trecho")
+        elif n:
+            text += f"   ·   legenda até {format_time(end)}"
+        self.statusbar.config(text=text)
         self._schedule_preview()
 
-    def _schedule_preview(self):
+    def _schedule_preview(self, delay: int = 120):
         if self._preview_job:
             self.after_cancel(self._preview_job)
-        self._preview_job = self.after(120, self._update_preview)
+        self._preview_job = self.after(delay, self._update_preview)
 
     def _selected_strophe(self) -> Optional[Strophe]:
         strophes = self.strophe_list.sorted_strophes()
@@ -2255,17 +3036,28 @@ class App(tk.Tk):
         self._preview_job = None
         if not HAS_PIL:
             return
+        p = self.project
         s = self._selected_strophe()
         strophes = self.strophe_list.sorted_strophes()
+        text = s.text if s else ""
+        screens = []
+        if s and p.is_short:  # the short shows the strophe in pieces: preview the first one
+            screens = build_screens([s], p.short.lines_per_screen, p.short.fade_duration)
+            text = screens[0].text if screens else text
+        w, h = self.song.preview_size()
         try:
-            img = render_preview(self.project, s.text if s else "",
-                                 SongPanel.PREVIEW_W, SongPanel.PREVIEW_H)
+            img = render_preview(p, text, w, h)
         except Exception:
             img = None
         if s:
             idx = strophes.index(s) + 1
             caption = (f"Estrofe {idx} de {len(strophes)}   ·   "
                        f"{format_time(s.start_time)} → {format_time(s.end_time)}")
+            if len(screens) > 1:  # the short shows it in pieces
+                caption += f"   ·   tela 1 de {len(screens)}"
+            clip = self._clip()
+            if p.is_short and clip and not (s.end_time > clip[0] and s.start_time < clip[1]):
+                caption += "   ·   fora do trecho"
         else:
             caption = "As estrofes aparecem aqui. Clique numa estrofe pra ver como fica."
         self.song.show_preview(img, caption)
@@ -2278,11 +3070,13 @@ class App(tk.Tk):
 
     def _load_project(self, project: Project, path: Optional[str]):
         """Swap the current project and refresh everything."""
+        self._stop_play()
         self.project = project
         self._current_file = path
         self._lyrics_audio = project.audio_file if project.strophes else None
         self.strophe_list.project = project
         self.strophe_list.selected_id = None
+        self.strophe_list.marked = set()
         self.strophe_list.refresh()
         self._sync_song_panel()
         self._on_project_change()
@@ -2332,6 +3126,7 @@ class App(tk.Tk):
             messagebox.showinfo("Escolha o áudio", "Escolha o áudio da música primeiro "
                                                    "(em Música → Áudio).")
             return
+        clip = self._clip() if p.is_short else None
 
         def on_done():
             self._lyrics_audio = p.audio_file
@@ -2343,15 +3138,28 @@ class App(tk.Tk):
         ask = bool(p.strophes) and self._lyrics_audio in (None, p.audio_file)
         AutoLyricsDialog(self, p, options=self.cfg,
                          on_options=lambda o: self._save_cfg(**o),
-                         on_done=on_done, ask_before_replace=ask)
+                         on_done=on_done, ask_before_replace=ask, clip=clip)
 
     def _render(self):
-        if not self.project.strophes:
+        p = self.project
+        if not p.strophes:
             messagebox.showwarning("Aviso", "Adicione ao menos uma estrofe antes de renderizar.")
             return
+        if p.is_short:
+            clip = self._clip()
+            if not clip:
+                messagebox.showwarning("Trecho do short",
+                                       "Escolha o início e o fim do trecho do short.")
+                return
+            if not any(s.end_time > clip[0] and s.start_time < clip[1] for s in p.strophes):
+                if not messagebox.askyesno("Trecho sem letra",
+                                           "Nenhuma estrofe cai dentro do trecho escolhido.\n"
+                                           "Renderizar mesmo assim?"):
+                    return
         out = self._ask_output_path()
         if out:
-            RenderDialog(self, self.project, out)
+            self._stop_play()
+            RenderDialog(self, p, out)
 
     def _ask_output_path(self) -> Optional[str]:
         transparent = project_is_transparent(self.project)
@@ -2362,9 +3170,12 @@ class App(tk.Tk):
         if not (initial_dir and os.path.isdir(initial_dir)):
             videos = os.path.join(os.path.expanduser("~"), "Videos")
             initial_dir = videos if os.path.isdir(videos) else os.path.expanduser("~")
+        name = safe_filename(self.project.title)
+        if self.project.is_short:
+            name += " - Short"
         path = filedialog.asksaveasfilename(
-            parent=self, title="Salvar vídeo como", initialdir=initial_dir,
-            initialfile=f"{safe_filename(self.project.title)}{ext}",
+            parent=self, title="Salvar short como" if self.project.is_short else "Salvar vídeo como",
+            initialdir=initial_dir, initialfile=f"{name}{ext}",
             defaultextension=ext, filetypes=types + [("Todos", "*.*")],
             confirmoverwrite=False)  # we ask ourselves (also covers .mp4 → .webm)
         if not path:
